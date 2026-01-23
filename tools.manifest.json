@@ -1,0 +1,26 @@
+{
+  "service": "ghl-mcp",
+  "version": "1.0.0",
+  "auth": { "header": "x-api-key" },
+  "tools": [
+    { "name": "contacts_upsert", "method": "POST", "path": "/tools/contacts_upsert", "mode": "write" },
+    { "name": "contacts_search", "method": "POST", "path": "/tools/contacts_search", "mode": "read" },
+    { "name": "contacts_update_status", "method": "POST", "path": "/tools/contacts_update_status", "mode": "write" },
+
+    { "name": "calendar_list_appointments", "method": "POST", "path": "/tools/calendar_list_appointments", "mode": "read" },
+    { "name": "calendar_create_appointment", "method": "POST", "path": "/tools/calendar_create_appointment", "mode": "write" },
+    { "name": "calendar_reschedule_appointment", "method": "POST", "path": "/tools/calendar_reschedule_appointment", "mode": "write" },
+    { "name": "calendar_cancel_appointment", "method": "POST", "path": "/tools/calendar_cancel_appointment", "mode": "write" },
+
+    { "name": "crm_read", "method": "POST", "path": "/tools/crm_read", "mode": "read" },
+
+    { "name": "conversations_list_threads", "method": "POST", "path": "/tools/conversations_list_threads", "mode": "read" },
+    { "name": "conversations_get_thread", "method": "POST", "path": "/tools/conversations_get_thread", "mode": "read" },
+    { "name": "conversations_send_message", "method": "POST", "path": "/tools/conversations_send_message", "mode": "write" },
+
+    { "name": "email_send", "method": "POST", "path": "/tools/email_send", "mode": "write" },
+    { "name": "sms_send", "method": "POST", "path": "/tools/sms_send", "mode": "write" },
+
+    { "name": "workflow_trigger", "method": "POST", "path": "/tools/workflow_trigger", "mode": "trigger" }
+  ]
+}

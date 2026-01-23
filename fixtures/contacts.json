@@ -1,0 +1,7 @@
+{
+  "contacts": [
+    { "id": "c_001", "name": "Bill Pienias", "role": "Executive", "phoneMasked": "***-***-1122", "tags": ["Executive"], "status": "Active" },
+    { "id": "c_002", "name": "John Sample", "role": "Lead", "phoneMasked": "***-***-3344", "tags": ["Lead"], "status": "New" },
+    { "id": "c_003", "name": "Mary Recruit", "role": "Recruit", "phoneMasked": "***-***-5566", "tags": ["Recruit"], "status": "Nurture" }
+  ]
+}
