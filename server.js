@@ -1,487 +1,1535 @@
-// =======================
-// Imports (MUST be first)
-// =======================
-import express from "express";
-import cors from "cors";
-import dotenv from "dotenv";
+/**
+ * GHL MCP Tool Gateway - Live Production Server
+ * 
+ * This server provides an MCP-compatible gateway to GoHighLevel/LeadConnector APIs
+ * using Private Integration Token (PIT) authentication.
+ * 
+ * Exposes 13 tools matching GHL Private Integration scopes:
+ * - contacts_search, contacts_upsert, contacts_update_status
+ * - calendar_list_appointments, calendar_create_appointment, calendar_reschedule_appointment, calendar_cancel_appointment
+ * - conversations_list_threads, conversations_get_thread, conversations_send_message
+ * - tasks_list, tasks_create, tasks_complete
+ * 
+ * Endpoints:
+ * - GET /health - Health check
+ * - GET /ready - Environment validation
+ * - POST /mcp - JSON-RPC handler (tools/list, tools/call)
+ * - GET /mcp - SSE status stream
+ * - GET /mcp/tools - Tool manifest (plain JSON)
+ * - GET /api/mcp/tools - Tool manifest (plain JSON, alias)
+ * - POST /tools/:toolName - Direct tool invocation
+ * - GET /oauth* - Returns 410 (OAuth disabled)
+ * 
+ * Authentication:
+ * Supports multiple methods:
+ * - Header: x-api-key: <MCP_API_KEY>
+ * - Header: Authorization: Bearer <MCP_API_KEY>
+ * - Header: Authorization: <MCP_API_KEY> (fallback)
+ * 
+ * Verification:
+ * curl -X POST https://api.command-finfitlife.com/mcp \
+ *   -H "Content-Type: application/json" \
+ *   -H "Authorization: Bearer <MCP_API_KEY>" \
+ *   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+ * 
+ * curl -X GET https://api.command-finfitlife.com/mcp/tools \
+ *   -H "Authorization: Bearer <MCP_API_KEY>"
+ */
 
-// =======================
-// Environment
-// =======================
-dotenv.config();
+// Load environment variables from .env file
+// Use relative path by default (same folder as server.js)
+// Support ENV_PATH override for custom deployments
+const ENV_PATH = process.env.ENV_PATH || '.env';
+const dotenvResult = require('dotenv').config({ path: ENV_PATH });
 
-// =======================
-// App setup
-// =======================
+// Log dotenv load status (without leaking secrets)
+if (dotenvResult.error) {
+  console.warn(`[GHL MCP Gateway] dotenv load warning: ${dotenvResult.error.message}`);
+  console.warn(`[GHL MCP Gateway] Attempted path: ${ENV_PATH}`);
+  // Fallback to relative .env in current directory
+  const fallbackResult = require('dotenv').config();
+  if (fallbackResult.error) {
+    console.error(`[GHL MCP Gateway] Failed to load .env from fallback location`);
+  } else {
+    console.log(`[GHL MCP Gateway] dotenv loaded from fallback: .env`);
+  }
+} else {
+  console.log(`[GHL MCP Gateway] dotenv loaded from: ${ENV_PATH}`);
+  console.log(`[GHL MCP Gateway] Loaded ${Object.keys(dotenvResult.parsed || {}).length} environment variables`);
+}
+
+const express = require('express');
+const cors = require('cors');
+
 const app = express();
-app.disable("x-powered-by");
-app.use(cors());
-app.use(express.json());
-// --- API Key Auth (protect endpoints) ---
-const requireApiKey = (req, res, next) => {
-  const provided = req.header("x-api-key");
-  const expected = process.env.MCP_API_KEY;
 
-  if (!expected) {
-    return res.status(500).json({ error: "Server missing MCP_API_KEY" });
+// ============================================================================
+// Configuration & Environment Variables
+// ============================================================================
+
+// Read env vars AFTER dotenv load (runtime getters, no caching)
+const MCP_API_KEY = process.env.MCP_API_KEY;
+const GHL_PIT_TOKEN = process.env.GHL_PIT_TOKEN;
+const GHL_LOCATION_ID = process.env.GHL_LOCATION_ID;
+const GHL_API_BASE = process.env.GHL_API_BASE || 'https://services.leadconnectorhq.com';
+const GHL_API_VERSION = process.env.GHL_API_VERSION || '2021-07-28';
+
+// ============================================================================
+// Middleware
+// ============================================================================
+
+app.use(express.json({ limit: '10mb' }));
+app.use(cors({
+  origin: true,
+  credentials: true,
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-api-key'],
+  exposedHeaders: ['Content-Type', 'Authorization', 'x-api-key'],
+}));
+
+// API Key gate for /mcp and /tools/*
+// Supports multiple authentication methods:
+// 1. Header: x-api-key == MCP_API_KEY
+// 2. Header: Authorization: Bearer <MCP_API_KEY>
+// 3. Header: Authorization: <MCP_API_KEY> (fallback)
+function requireApiKey(req, res, next) {
+  // Extract API key from multiple sources
+  const xApiKey = req.headers['x-api-key'];
+  const authHeader = req.headers['authorization'];
+  const queryKey = req.query.apiKey;
+  
+  let providedKey = null;
+  let authMethod = 'none';
+  
+  // Try x-api-key header first (existing behavior)
+  if (xApiKey) {
+    providedKey = xApiKey;
+    authMethod = 'x-api-key';
   }
-
-  if (!provided || provided !== expected) {
-    return res.status(401).json({ error: "Unauthorized" });
+  // Try Authorization: Bearer <token>
+  else if (authHeader && authHeader.startsWith('Bearer ')) {
+    providedKey = authHeader.substring(7).trim();
+    authMethod = 'authorization-bearer';
   }
-
+  // Try Authorization: <token> (fallback)
+  else if (authHeader) {
+    providedKey = authHeader.trim();
+    authMethod = 'authorization-plain';
+  }
+  // Try query parameter (fallback)
+  else if (queryKey) {
+    providedKey = queryKey;
+    authMethod = 'query-param';
+  }
+  
+  // Log auth attempt for debugging
+  console.log(`[MCP] Auth check:`, {
+    authMethod,
+    hasProvidedKey: !!providedKey,
+    providedKeyLength: providedKey?.length || 0,
+    providedKeyPreview: providedKey ? `${providedKey.slice(0, 6)}...${providedKey.slice(-4)}` : 'NONE',
+    expectedKeyLength: MCP_API_KEY?.length || 0,
+    expectedKeyPreview: MCP_API_KEY ? `${MCP_API_KEY.slice(0, 6)}...${MCP_API_KEY.slice(-4)}` : 'NOT SET',
+    match: providedKey === MCP_API_KEY,
+  });
+  
+  if (!MCP_API_KEY) {
+    console.error(`[MCP] MCP_API_KEY not configured in environment`);
+    return res.status(500).json({
+      error: 'Server configuration error',
+      message: 'MCP_API_KEY not configured',
+    });
+  }
+  
+  if (!providedKey) {
+    console.error(`[MCP] Missing authentication (tried: x-api-key, Authorization: Bearer, Authorization, query param)`);
+    return res.status(401).json({
+      error: 'Unauthorized',
+      message: 'Missing authentication header. Use x-api-key or Authorization: Bearer <token>',
+    });
+  }
+  
+  if (providedKey !== MCP_API_KEY) {
+    console.error(`[MCP] Invalid API key provided (method: ${authMethod})`);
+    return res.status(401).json({
+      error: 'Unauthorized',
+      message: `Invalid authentication (method: ${authMethod})`,
+    });
+  }
+  
+  console.log(`[MCP] ✅ Auth successful (method: ${authMethod})`);
   next();
+}
+
+// ============================================================================
+// GHL HTTP Client Wrapper
+// ============================================================================
+
+/**
+ * Makes authenticated requests to GoHighLevel/LeadConnector API
+ * @param {string} method - HTTP method
+ * @param {string} path - API path (e.g., '/contacts')
+ * @param {object} options - { query, body, timeout }
+ * @returns {Promise<{ok: boolean, status: number, data?: any, error?: string, details?: any}>}
+ */
+async function ghlRequest(method, path, options = {}) {
+  const { query = {}, body, timeout = 30000 } = options;
+
+  if (!GHL_PIT_TOKEN) {
+    return {
+      ok: false,
+      status: 500,
+      error: 'GHL_PIT_TOKEN not configured',
+      details: {
+        endpoint: path,
+        status: 500,
+      },
+    };
+  }
+
+  // Build query string
+  const queryParams = new URLSearchParams();
+  Object.entries(query).forEach(([key, value]) => {
+    if (value !== undefined && value !== null) {
+      queryParams.append(key, String(value));
+    }
+  });
+  const queryString = queryParams.toString();
+  const url = `${GHL_API_BASE}${path}${queryString ? `?${queryString}` : ''}`;
+
+  // Build headers
+  const headers = {
+    'Authorization': `Bearer ${GHL_PIT_TOKEN}`,
+    'Version': GHL_API_VERSION,
+    'Content-Type': 'application/json',
+    'Accept': 'application/json',
+  };
+
+  // Create abort controller for timeout
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeout);
+
+  try {
+    const fetchOptions = {
+      method,
+      headers,
+      signal: controller.signal,
+    };
+
+    if (body && (method === 'POST' || method === 'PUT' || method === 'PATCH')) {
+      fetchOptions.body = JSON.stringify(body);
+    }
+
+    const response = await fetch(url, fetchOptions);
+    clearTimeout(timeoutId);
+
+    const contentType = response.headers.get('content-type');
+    let data;
+    
+    if (contentType && contentType.includes('application/json')) {
+      data = await response.json();
+    } else {
+      data = await response.text();
+    }
+
+    if (!response.ok) {
+      // Extract safe error message (don't log full payloads)
+      let errorMessage = `GHL API error (${response.status})`;
+      if (typeof data === 'object' && data?.message) {
+        errorMessage = String(data.message);
+      } else if (typeof data === 'string' && data.length < 200) {
+        errorMessage = data;
+      }
+      
+      return {
+        ok: false,
+        status: response.status,
+        error: errorMessage,
+        details: {
+          endpoint: path,
+          status: response.status,
+        },
+      };
+    }
+
+    return {
+      ok: true,
+      status: response.status,
+      data,
+    };
+  } catch (error) {
+    clearTimeout(timeoutId);
+    
+    if (error.name === 'AbortError') {
+      return {
+        ok: false,
+        status: 504,
+        error: 'Request timeout',
+        details: {
+          endpoint: path,
+          status: 504,
+          timeout,
+        },
+      };
+    }
+
+    return {
+      ok: false,
+      status: 502,
+      error: 'Upstream request failed',
+      details: {
+        endpoint: path,
+        status: 502,
+      },
+    };
+  }
+}
+
+// ============================================================================
+// Tool Handlers
+// ============================================================================
+
+/**
+ * Search contacts by query string
+ * 
+ * Note: GHL API expects 'pageLimit' (not 'limit'). For backwards compatibility,
+ * we accept either 'limit' or 'pageLimit' and translate to 'pageLimit'.
+ * Validates pageLimit as positive integer (min 1, max 100).
+ */
+async function handleContactsSearch(args) {
+  const { query, locationId, limit, pageLimit } = args;
+  
+  if (!query) {
+    return { error: 'query parameter is required', status: 400 };
+  }
+
+  const locId = locationId || GHL_LOCATION_ID;
+  if (!locId) {
+    return { error: 'locationId is required', status: 400 };
+  }
+
+  // Normalize: accept either pageLimit or limit, default to 10
+  const rawPageLimit = pageLimit ?? limit ?? 10;
+  
+  // Validate and normalize to positive integer
+  const ghlPageLimit = Number(rawPageLimit);
+  if (isNaN(ghlPageLimit) || ghlPageLimit < 1 || ghlPageLimit > 100 || !Number.isInteger(ghlPageLimit)) {
+    return { 
+      error: 'pageLimit must be a positive integer between 1 and 100', 
+      status: 400 
+    };
+  }
+
+  const searchBody = {
+    locationId: locId,
+    query,
+    pageLimit: ghlPageLimit, // Always send pageLimit (GHL rejects 'limit' property)
+  };
+
+  const result = await ghlRequest('POST', `/contacts/search`, {
+    body: searchBody,
+  });
+
+  if (!result.ok) {
+    return { error: result.error, status: result.status, details: result.details };
+  }
+
+  return { contacts: result.data?.contacts || result.data || [] };
+}
+
+/**
+ * Upsert contact: search by phone/email, update if found, create if not
+ */
+async function handleContactsUpsert(args) {
+  const { firstName, lastName, phone, email, tags, locationId } = args;
+  
+  const locId = locationId || GHL_LOCATION_ID;
+  if (!locId) {
+    return { error: 'locationId is required', status: 400 };
+  }
+
+  if (!firstName || !lastName) {
+    return { error: 'firstName and lastName are required', status: 400 };
+  }
+
+  // Build name from firstName and lastName
+  const name = `${firstName} ${lastName}`.trim();
+
+  // Search for existing contact using POST /contacts/search
+  let existingContact = null;
+  if (phone) {
+    const searchResult = await ghlRequest('POST', `/contacts/search`, {
+      body: {
+        locationId: locId,
+        phone,
+      },
+    });
+    if (searchResult.ok && searchResult.data?.contacts?.length > 0) {
+      existingContact = searchResult.data.contacts[0];
+    }
+  }
+  
+  if (!existingContact && email) {
+    const searchResult = await ghlRequest('POST', `/contacts/search`, {
+      body: {
+        locationId: locId,
+        email,
+      },
+    });
+    if (searchResult.ok && searchResult.data?.contacts?.length > 0) {
+      existingContact = searchResult.data.contacts[0];
+    }
+  }
+
+  const contactData = {
+    name,
+    firstName,
+    lastName,
+    phone,
+    email,
+    locationId: locId,
+  };
+  
+  if (tags && Array.isArray(tags)) {
+    contactData.tags = tags;
+  }
+
+  if (existingContact) {
+    // Update existing contact
+    const result = await ghlRequest('PUT', `/contacts/${existingContact.id}`, {
+      body: contactData,
+    });
+    
+    if (!result.ok) {
+      return { error: result.error, status: result.status, details: result.details };
+    }
+    
+    return { contact: result.data?.contact || result.data, action: 'updated' };
+  } else {
+    // Create new contact
+    const result = await ghlRequest('POST', `/contacts`, {
+      body: contactData,
+    });
+    
+    if (!result.ok) {
+      return { error: result.error, status: result.status, details: result.details };
+    }
+    
+    return { contact: result.data?.contact || result.data, action: 'created' };
+  }
+}
+
+/**
+ * Update contact status (tags and/or pipeline stage)
+ */
+async function handleContactsUpdateStatus(args) {
+  const { contactId, addTags, removeTags, stageId, locationId } = args;
+  
+  if (!contactId) {
+    return { error: 'contactId is required', status: 400 };
+  }
+
+  const locId = locationId || GHL_LOCATION_ID;
+  if (!locId) {
+    return { error: 'locationId is required', status: 400 };
+  }
+
+  const updateData = {};
+  if (addTags && Array.isArray(addTags)) {
+    updateData.addTags = addTags;
+  }
+  if (removeTags && Array.isArray(removeTags)) {
+    updateData.removeTags = removeTags;
+  }
+  if (stageId !== undefined) {
+    updateData.stageId = stageId;
+  }
+
+  if (Object.keys(updateData).length === 0) {
+    return { error: 'addTags, removeTags, or stageId is required', status: 400 };
+  }
+
+  const result = await ghlRequest('PUT', `/contacts/${contactId}`, {
+    body: updateData,
+  });
+
+  if (!result.ok) {
+    return { error: result.error, status: result.status, details: result.details };
+  }
+
+  return { contact: result.data?.contact || result.data };
+}
+
+/**
+ * List appointments for a calendar between dates
+ */
+async function handleCalendarListAppointments(args) {
+  const { calendarId, startDateTime, endDateTime, limit, locationId } = args;
+  
+  if (!calendarId) {
+    return { error: 'calendarId is required', status: 400 };
+  }
+  if (!startDateTime) {
+    return { error: 'startDateTime is required', status: 400 };
+  }
+  if (!endDateTime) {
+    return { error: 'endDateTime is required', status: 400 };
+  }
+
+  const locId = locationId || GHL_LOCATION_ID;
+  if (!locId) {
+    return { error: 'locationId is required', status: 400 };
+  }
+
+  const query = {
+    locationId: locId,
+    calendarId,
+    startDate: startDateTime,
+    endDate: endDateTime,
+  };
+
+  if (limit) query.limit = limit;
+
+  const result = await ghlRequest('GET', `/calendars/${calendarId}/appointments`, {
+    query,
+  });
+
+  if (!result.ok) {
+    return { error: result.error, status: result.status, details: result.details };
+  }
+
+  return { appointments: result.data?.appointments || result.data || [] };
+}
+
+/**
+ * Create appointment
+ */
+async function handleCalendarCreateAppointment(args) {
+  const { calendarId, contactId, startTime, startDateTime, endTime, endDateTime, title, notes, locationId, ...otherFields } = args;
+  
+  if (!calendarId) {
+    return { error: 'calendarId is required', status: 400 };
+  }
+  if (!contactId) {
+    return { error: 'contactId is required', status: 400 };
+  }
+  if (!startTime && !startDateTime) {
+    return { error: 'startTime or startDateTime is required', status: 400 };
+  }
+
+  const locId = locationId || GHL_LOCATION_ID;
+  if (!locId) {
+    return { error: 'locationId is required', status: 400 };
+  }
+
+  const appointmentData = {
+    calendarId,
+    contactId,
+    title,
+    notes,
+    ...otherFields,
+  };
+  
+  // Support both startTime/endTime and startDateTime/endDateTime for compatibility
+  if (startDateTime) {
+    appointmentData.startTime = startDateTime;
+  } else {
+    appointmentData.startTime = startTime;
+  }
+  
+  if (endDateTime) {
+    appointmentData.endTime = endDateTime;
+  } else if (endTime) {
+    appointmentData.endTime = endTime;
+  }
+
+  const result = await ghlRequest('POST', `/calendars/events/appointments`, {
+    body: appointmentData,
+  });
+
+  if (!result.ok) {
+    return { error: result.error, status: result.status, details: result.details };
+  }
+
+  return { appointment: result.data?.appointment || result.data };
+}
+
+/**
+ * Reschedule appointment
+ */
+async function handleCalendarRescheduleAppointment(args) {
+  const { appointmentId, newStartDateTime, newEndDateTime, locationId } = args;
+  
+  if (!appointmentId) {
+    return { error: 'appointmentId is required', status: 400 };
+  }
+  if (!newStartDateTime) {
+    return { error: 'newStartDateTime is required', status: 400 };
+  }
+  if (!newEndDateTime) {
+    return { error: 'newEndDateTime is required', status: 400 };
+  }
+
+  const locId = locationId || GHL_LOCATION_ID;
+  if (!locId) {
+    return { error: 'locationId is required', status: 400 };
+  }
+
+  const updateData = {
+    startTime: newStartDateTime,
+    endTime: newEndDateTime,
+  };
+
+  const result = await ghlRequest('PUT', `/appointments/${appointmentId}`, {
+    body: updateData,
+  });
+
+  if (!result.ok) {
+    return { error: result.error, status: result.status, details: result.details };
+  }
+
+  return { appointment: result.data?.appointment || result.data };
+}
+
+/**
+ * Cancel appointment
+ */
+async function handleCalendarCancelAppointment(args) {
+  const { appointmentId, reasonCode, locationId } = args;
+  
+  if (!appointmentId) {
+    return { error: 'appointmentId is required', status: 400 };
+  }
+
+  const locId = locationId || GHL_LOCATION_ID;
+  if (!locId) {
+    return { error: 'locationId is required', status: 400 };
+  }
+
+  const cancelData = { locationId: locId };
+  if (reasonCode) {
+    cancelData.reasonCode = reasonCode;
+  }
+
+  const result = await ghlRequest('PUT', `/appointments/${appointmentId}/cancel`, {
+    body: cancelData,
+  });
+
+  if (!result.ok) {
+    return { error: result.error, status: result.status, details: result.details };
+  }
+
+  return { success: true, appointment: result.data?.appointment || result.data };
+}
+
+/**
+ * List tasks
+ */
+async function handleTasksList(args) {
+  const { dueWindow, limit, locationId } = args;
+  
+  const locId = locationId || GHL_LOCATION_ID;
+  if (!locId) {
+    return { error: 'locationId is required', status: 400 };
+  }
+
+  const query = { locationId: locId };
+  
+  // Map dueWindow to appropriate query parameters
+  if (dueWindow === 'overdue') {
+    query.status = 'pending';
+    // Add date filter for overdue (would need current date logic)
+  } else if (dueWindow === 'today') {
+    // Add date filter for today
+  } else if (dueWindow === 'next7') {
+    // Add date filter for next 7 days
+  }
+  
+  if (limit) query.limit = limit;
+
+  const result = await ghlRequest('GET', `/tasks`, {
+    query,
+  });
+
+  if (!result.ok) {
+    return { error: result.error, status: result.status, details: result.details };
+  }
+
+  return { tasks: result.data?.tasks || result.data || [] };
+}
+
+/**
+ * Create task
+ */
+async function handleTasksCreate(args) {
+  const { title, dueDateTime, contactId, priority, locationId } = args;
+  
+  if (!title) {
+    return { error: 'title is required', status: 400 };
+  }
+  if (!dueDateTime) {
+    return { error: 'dueDateTime is required', status: 400 };
+  }
+
+  const locId = locationId || GHL_LOCATION_ID;
+  if (!locId) {
+    return { error: 'locationId is required', status: 400 };
+  }
+
+  // contactId is optional - GHL API requires it, so validate if not provided
+  if (!contactId) {
+    return { error: 'contactId is required by GHL API', status: 400 };
+  }
+
+  const taskData = {
+    title,
+    dueDate: dueDateTime,
+  };
+  
+  if (priority && ['low', 'normal', 'high'].includes(priority)) {
+    taskData.priority = priority;
+  }
+
+  const result = await ghlRequest('POST', `/contacts/${contactId}/tasks`, {
+    body: taskData,
+  });
+
+  if (!result.ok) {
+    return { error: result.error, status: result.status, details: result.details };
+  }
+
+  return { task: result.data?.task || result.data };
+}
+
+/**
+ * Complete task
+ */
+async function handleTasksComplete(args) {
+  const { taskId, locationId } = args;
+  
+  if (!taskId) {
+    return { error: 'taskId is required', status: 400 };
+  }
+
+  const locId = locationId || GHL_LOCATION_ID;
+  if (!locId) {
+    return { error: 'locationId is required', status: 400 };
+  }
+
+  const result = await ghlRequest('PUT', `/tasks/${taskId}/complete`, {
+    body: { locationId: locId },
+  });
+
+  if (!result.ok) {
+    return { error: result.error, status: result.status, details: result.details };
+  }
+
+  return { success: true, task: result.data?.task || result.data };
+}
+
+/**
+ * List conversation threads
+ */
+async function handleConversationsListThreads(args) {
+  const { channel, unreadOnly, limit, locationId } = args;
+  
+  const locId = locationId || GHL_LOCATION_ID;
+  if (!locId) {
+    return { error: 'locationId is required', status: 400 };
+  }
+
+  const query = { locationId: locId };
+  
+  if (channel && ['email', 'sms'].includes(channel)) {
+    query.channel = channel;
+  }
+  
+  if (unreadOnly === true) {
+    query.unreadOnly = true;
+  }
+  
+  if (limit) query.limit = limit;
+
+  const result = await ghlRequest('GET', `/conversations`, {
+    query,
+  });
+
+  if (!result.ok) {
+    return { error: result.error, status: result.status, details: result.details };
+  }
+
+  return { conversations: result.data?.conversations || result.data || [] };
+}
+
+/**
+ * Get conversation thread
+ */
+async function handleConversationsGetThread(args) {
+  const { threadId, limitMessages, locationId } = args;
+  
+  if (!threadId) {
+    return { error: 'threadId is required', status: 400 };
+  }
+
+  const locId = locationId || GHL_LOCATION_ID;
+  if (!locId) {
+    return { error: 'locationId is required', status: 400 };
+  }
+
+  const query = { locationId: locId };
+  if (limitMessages) {
+    query.limit = limitMessages;
+  }
+
+  const result = await ghlRequest('GET', `/conversations/${threadId}`, {
+    query,
+  });
+
+  if (!result.ok) {
+    return { error: result.error, status: result.status, details: result.details };
+  }
+
+  return { conversation: result.data?.conversation || result.data };
+}
+
+/**
+ * Send message in conversation
+ */
+async function handleConversationsSendMessage(args) {
+  const { threadId, message, channel, locationId } = args;
+  
+  if (!threadId) {
+    return { error: 'threadId is required', status: 400 };
+  }
+  if (!message) {
+    return { error: 'message is required', status: 400 };
+  }
+
+  const locId = locationId || GHL_LOCATION_ID;
+  if (!locId) {
+    return { error: 'locationId is required', status: 400 };
+  }
+
+  const messageData = {
+    conversationId: threadId,
+    message,
+    locationId: locId,
+  };
+  
+  if (channel && ['email', 'sms'].includes(channel)) {
+    messageData.channel = channel;
+  }
+
+  const result = await ghlRequest('POST', `/conversations/messages`, {
+    body: messageData,
+  });
+
+  if (!result.ok) {
+    return { error: result.error, status: result.status, details: result.details };
+  }
+
+  return { message: result.data?.message || result.data };
+}
+
+
+// ============================================================================
+// Tool Registry
+// ============================================================================
+
+const TOOLS = {
+  contacts_search: {
+    name: 'contacts_search',
+    description: 'Search contacts by query',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        query: { type: 'string' },
+        pageLimit: { type: 'number' },
+        limit: { type: 'number' }, // Deprecated: use pageLimit. Accepted for backwards compatibility.
+      },
+      required: ['query'],
+    },
+    handler: handleContactsSearch,
+  },
+  contacts_upsert: {
+    name: 'contacts_upsert',
+    description: 'Create or update a contact',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        firstName: { type: 'string' },
+        lastName: { type: 'string' },
+        phone: { type: 'string' },
+        email: { type: 'string' },
+        tags: { type: 'array', items: { type: 'string' } },
+      },
+      required: ['firstName', 'lastName'],
+    },
+    handler: handleContactsUpsert,
+  },
+  contacts_update_status: {
+    name: 'contacts_update_status',
+    description: 'Update tags/stage for a contact',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        contactId: { type: 'string' },
+        addTags: { type: 'array', items: { type: 'string' } },
+        removeTags: { type: 'array', items: { type: 'string' } },
+        stageId: { type: 'string' },
+      },
+      required: ['contactId'],
+    },
+    handler: handleContactsUpdateStatus,
+  },
+  calendar_list_appointments: {
+    name: 'calendar_list_appointments',
+    description: 'List appointments in a calendar window',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        calendarId: { type: 'string' },
+        startDateTime: { type: 'string' },
+        endDateTime: { type: 'string' },
+        limit: { type: 'number' },
+      },
+      required: ['calendarId', 'startDateTime', 'endDateTime'],
+    },
+    handler: handleCalendarListAppointments,
+  },
+  calendar_create_appointment: {
+    name: 'calendar_create_appointment',
+    description: 'Create an appointment',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        calendarId: { type: 'string' },
+        contactId: { type: 'string' },
+        title: { type: 'string' },
+        startDateTime: { type: 'string' },
+        endDateTime: { type: 'string' },
+      },
+      required: ['calendarId', 'contactId', 'title', 'startDateTime', 'endDateTime'],
+    },
+    handler: handleCalendarCreateAppointment,
+  },
+  calendar_reschedule_appointment: {
+    name: 'calendar_reschedule_appointment',
+    description: 'Reschedule an appointment',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        appointmentId: { type: 'string' },
+        newStartDateTime: { type: 'string' },
+        newEndDateTime: { type: 'string' },
+      },
+      required: ['appointmentId', 'newStartDateTime', 'newEndDateTime'],
+    },
+    handler: handleCalendarRescheduleAppointment,
+  },
+  calendar_cancel_appointment: {
+    name: 'calendar_cancel_appointment',
+    description: 'Cancel an appointment',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        appointmentId: { type: 'string' },
+        reasonCode: { type: 'string' },
+      },
+      required: ['appointmentId'],
+    },
+    handler: handleCalendarCancelAppointment,
+  },
+  tasks_list: {
+    name: 'tasks_list',
+    description: 'List tasks by due window',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        dueWindow: { type: 'string', enum: ['overdue', 'today', 'next7'] },
+        limit: { type: 'number' },
+      },
+    },
+    handler: handleTasksList,
+  },
+  tasks_create: {
+    name: 'tasks_create',
+    description: 'Create a task',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        title: { type: 'string' },
+        dueDateTime: { type: 'string' },
+        contactId: { type: 'string' },
+        priority: { type: 'string', enum: ['low', 'normal', 'high'] },
+      },
+      required: ['title', 'dueDateTime', 'contactId'],
+    },
+    handler: handleTasksCreate,
+  },
+  tasks_complete: {
+    name: 'tasks_complete',
+    description: 'Complete task',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        taskId: { type: 'string' },
+        locationId: { type: 'string' },
+      },
+      required: ['taskId'],
+    },
+    handler: handleTasksComplete,
+  },
+  conversations_list_threads: {
+    name: 'conversations_list_threads',
+    description: 'List recent threads for a channel',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        channel: { type: 'string', enum: ['email', 'sms'] },
+        unreadOnly: { type: 'boolean' },
+        limit: { type: 'number' },
+      },
+    },
+    handler: handleConversationsListThreads,
+  },
+  conversations_get_thread: {
+    name: 'conversations_get_thread',
+    description: 'Fetch messages for a thread',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        threadId: { type: 'string' },
+        limitMessages: { type: 'number' },
+      },
+      required: ['threadId'],
+    },
+    handler: handleConversationsGetThread,
+  },
+  conversations_send_message: {
+    name: 'conversations_send_message',
+    description: 'Send a message into an existing thread',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        threadId: { type: 'string' },
+        message: { type: 'string' },
+        channel: { type: 'string', enum: ['email', 'sms'] },
+      },
+      required: ['threadId', 'message'],
+    },
+    handler: handleConversationsSendMessage,
+  },
 };
 
-const PORT = process.env.PORT || 3333;
+// ============================================================================
+// Tool Handler Router
+// ============================================================================
 
-// =======================
-// Health check
-// =======================
-app.get("/health", (req, res) => {
-  res.json({ status: "ok", service: "GHL MCP Server" });
-});
-app.get("/ready", (req, res) => {
-  if (!process.env.MCP_API_KEY) {
-    return res.status(503).json({ status: "not_ready", missing: ["MCP_API_KEY"] });
+async function handleTool(toolName, args) {
+  const tool = TOOLS[toolName];
+  
+  if (!tool) {
+    return {
+      error: `Unknown tool: ${toolName}`,
+      status: 404,
+      details: {
+        endpoint: toolName,
+        status: 404,
+      },
+    };
   }
 
-  // Mock mode = system is allowed to run without live CRM
-  if (process.env.MOCK_GHL === "true") {
-    return res.json({ status: "ready", mode: "mock" });
-  }
-
-  // Live mode requires a real GHL key
-  if (!process.env.GHL_API_KEY) {
-    return res.status(503).json({ status: "not_ready", missing: ["GHL_API_KEY"] });
-  }
-
-  return res.json({ status: "ready", mode: "live" });
-});
-
-
-// =======================
-// Root check (optional)
-// =======================
-app.get("/", (req, res) => {
-  res.send("GHL MCP Server is running");
-});
-
-// =======================
-// MCP Tool: crm_read
-// =======================
-app.use("/tools", requireApiKey);
-// =======================
-// Tool Endpoints (separate per function) — MOCK FIRST
-// =======================
-
-// Helper to return MCP JSON wrapper
-const mcpJson = (res, json) => res.json({ content: [{ type: "json", json }] });
-
-// MOCK helper
-const isMock = () => process.env.MOCK_GHL === "true";
-
-// -----------------------
-// CONTACTS
-// -----------------------
-
-// Create/Update contact immediately
-app.post("/tools/contacts_upsert", async (req, res) => {
-  const { firstName, lastName, phone, email, tags = [] } = req.body || {};
-
-  if (!phone && !email) return res.status(400).json({ error: "phone or email required" });
-  if (!firstName || !lastName) return res.status(400).json({ error: "firstName and lastName required" });
-
-  if (isMock()) {
-    return mcpJson(res, {
-      created: true,
-      matchedBy: phone ? "phone" : "email",
-      contactId: "mock_contact_" + Math.random().toString(36).slice(2, 10),
-      tags,
-    });
-  }
-
-  return res.status(501).json({ error: "Live OAuth not implemented yet" });
-});
-
-// Search contacts
-app.post("/tools/contacts_search", async (req, res) => {
-  const { query, limit = 5 } = req.body || {};
-  if (!query) return res.status(400).json({ error: "query required" });
-
-  if (isMock()) {
-    return mcpJson(res, {
-      results: [
-        {
-          contactId: "mock_contact_abc123",
-          name: "John Smith",
-          phone: "+1561***1212",
-          email: "jo***@email.com",
-          stage: "App Set",
-          tags: ["Warm"],
-        },
-      ].slice(0, Math.min(limit, 10)),
-    });
-  }
-
-  return res.status(501).json({ error: "Live OAuth not implemented yet" });
-});
-
-// Update tags/stage only
-app.post("/tools/contacts_update_status", async (req, res) => {
-  const { contactId, addTags = [], removeTags = [], stageId } = req.body || {};
-  if (!contactId) return res.status(400).json({ error: "contactId required" });
-
-  const hasUpdate = addTags.length || removeTags.length || !!stageId;
-  if (!hasUpdate) return res.status(400).json({ error: "provide addTags/removeTags/stageId" });
-
-  if (isMock()) {
-    return mcpJson(res, {
-      contactId,
-      updated: { addTags, removeTags, stageId: stageId || null },
-    });
-  }
-
-  return res.status(501).json({ error: "Live OAuth not implemented yet" });
-});
-
-// -----------------------
-// CALENDAR (RCDM)
-// -----------------------
-
-// List appointments
-app.post("/tools/calendar_list_appointments", async (req, res) => {
-  const { calendarId, startDateTime, endDateTime, limit = 25 } = req.body || {};
-  if (!calendarId || !startDateTime || !endDateTime) {
-    return res.status(400).json({ error: "calendarId, startDateTime, endDateTime required" });
-  }
-
-  if (isMock()) {
-    return mcpJson(res, {
-      calendarId,
-      appointments: [
-        {
-          appointmentId: "mock_apt_1",
-          start: startDateTime,
-          end: endDateTime,
-          title: "Intro Call",
-          contactId: "mock_contact_abc123",
-          status: "confirmed",
-        },
-      ].slice(0, Math.min(limit, 50)),
-    });
-  }
-
-  return res.status(501).json({ error: "Live OAuth not implemented yet" });
-});
-
-// Create appointment
-app.post("/tools/calendar_create_appointment", async (req, res) => {
-  const { calendarId, contactId, title, startDateTime, endDateTime } = req.body || {};
-  if (!calendarId || !contactId || !title || !startDateTime || !endDateTime) {
-    return res.status(400).json({ error: "calendarId, contactId, title, startDateTime, endDateTime required" });
-  }
-
-  if (isMock()) {
-    return mcpJson(res, {
-      appointmentId: "mock_apt_" + Math.random().toString(36).slice(2, 8),
-      status: "confirmed",
-    });
-  }
-
-  return res.status(501).json({ error: "Live OAuth not implemented yet" });
-});
-
-// Reschedule appointment
-app.post("/tools/calendar_reschedule_appointment", async (req, res) => {
-  const { appointmentId, newStartDateTime, newEndDateTime } = req.body || {};
-  if (!appointmentId || !newStartDateTime || !newEndDateTime) {
-    return res.status(400).json({ error: "appointmentId, newStartDateTime, newEndDateTime required" });
-  }
-
-  if (isMock()) {
-    return mcpJson(res, { appointmentId, status: "rescheduled" });
-  }
-
-  return res.status(501).json({ error: "Live OAuth not implemented yet" });
-});
-
-// Cancel appointment
-app.post("/tools/calendar_cancel_appointment", async (req, res) => {
-  const { appointmentId, reasonCode } = req.body || {};
-  if (!appointmentId) return res.status(400).json({ error: "appointmentId required" });
-
-  if (isMock()) {
-    return mcpJson(res, { appointmentId, status: "cancelled", reasonCode: reasonCode || null });
-  }
-
-  return res.status(501).json({ error: "Live OAuth not implemented yet" });
-});
-
-
-app.post("/tools/crm_read", async (req, res) => {
   try {
-    const { endpoint } = req.body;
-
-    if (!endpoint) {
-      return res.status(400).json({ error: "Missing endpoint" });
+    const result = await tool.handler(args);
+    
+    // Normalize error responses - ensure details includes endpoint
+    if (result.error) {
+      const status = result.status || 500;
+      return {
+        error: result.error,
+        status,
+        details: {
+          ...result.details,
+          endpoint: result.details?.endpoint || toolName,
+        },
+      };
     }
-if (process.env.MOCK_GHL === "true") {
+    
+    return result;
+  } catch (error) {
+    // Don't log full error objects that might contain sensitive data
+    console.error(`[tool:${toolName}] Error:`, error.message);
+    return {
+      error: 'Internal server error',
+      status: 500,
+      details: {
+        endpoint: toolName,
+        status: 500,
+      },
+    };
+  }
+}
+
+// ============================================================================
+// Routes
+// ============================================================================
+
+// Health check
+app.get('/health', (req, res) => {
+  res.json({ ok: true });
+});
+
+// Environment validation
+// Checks process.env AFTER dotenv load to ensure values are available
+app.get('/ready', (req, res) => {
+  // Re-read env vars at request time (no caching)
+  const pitToken = process.env.GHL_PIT_TOKEN;
+  const locationId = process.env.GHL_LOCATION_ID;
+  
+  const missing = [];
+  if (!pitToken) missing.push('GHL_PIT_TOKEN');
+  if (!locationId) missing.push('GHL_LOCATION_ID');
+  
+  // Structured logging for ready check
+  console.log(`[GHL MCP Gateway] /ready check:`, {
+    hasPitToken: !!pitToken,
+    hasLocationId: !!locationId,
+    missingCount: missing.length,
+    missingKeys: missing.length > 0 ? missing : undefined,
+  });
+  
+  if (missing.length > 0) {
+    return res.status(503).json({
+      ok: false,
+      missing,
+      message: 'Server not ready: missing required environment variables',
+    });
+  }
+  
+  res.json({ ok: true });
+});
+
+// Health check for ALB/load balancer
+app.get('/api/mcp/health', (req, res) => {
+  res.json({ ok: true });
+});
+
+// Tool manifest endpoint (GET) - for Agent Builder discovery
+// Returns same format as tools/list JSON-RPC response
+app.get('/api/mcp/tools', requireApiKey, (req, res) => {
+  const tools = Object.values(TOOLS).map(tool => ({
+    name: tool.name,
+    description: tool.description,
+    inputSchema: tool.inputSchema,
+  }));
+  
+  res.json({ tools });
+});
+
+// Tool manifest endpoint (GET) - alias for /mcp/tools
+app.get('/mcp/tools', requireApiKey, (req, res) => {
+  const tools = Object.values(TOOLS).map(tool => ({
+    name: tool.name,
+    description: tool.description,
+    inputSchema: tool.inputSchema,
+  }));
+  
+  res.json({ tools });
+});
+
+// OAuth routes - hard disabled (410)
+app.get(/^\/oauth/, (req, res) => {
+  res.status(410).json({
+    error: 'OAuth is disabled',
+    message: 'This server uses Private Integration Token (PIT) authentication only',
+  });
+});
+
+// Direct tool invocation
+app.post('/tools/:toolName', requireApiKey, async (req, res) => {
+  const { toolName } = req.params;
+  const args = req.body;
+  
+  const result = await handleTool(toolName, args);
+  
+  if (result.error) {
+    const status = result.status || 500;
+    return res.status(status).json({ error: result.error, details: result.details });
+  }
+  
+  res.json(result);
+});
+
+// JSON-RPC MCP POST handler (shared)
+async function mcpPostHandler(req, res) {
+  let requestBody = req.body;
+  let requestId = null;
+  let requestMethod = null;
+  let requestParams = null;
+  
+  // Handle edge cases - if body is not an object, treat as empty
+  if (!requestBody || typeof requestBody !== 'object' || Array.isArray(requestBody)) {
+    // If body is not an object, treat as empty (might be tools/list with empty body)
+    if (Array.isArray(requestBody)) {
+      console.log(`[MCP] Body is array, treating as empty`);
+      requestBody = {};
+    } else if (!requestBody || typeof requestBody !== 'object') {
+      console.log(`[MCP] Body is not object, treating as empty`);
+      requestBody = {};
+    }
+  }
+  
+  // Loosen JSON-RPC parsing - accept id as number or string, missing params
+  requestId = requestBody.id !== undefined ? requestBody.id : null;
+  requestMethod = requestBody.method || null;
+  requestParams = requestBody.params !== undefined ? requestBody.params : null;
+  const jsonrpc = requestBody.jsonrpc;
+  
+  // Normalize method name (handle dot notation variants)
+  let normalizedMethod = requestMethod ? String(requestMethod) : "";
+  if (normalizedMethod === "tools.list") normalizedMethod = "tools/list";
+  if (normalizedMethod === "tools.call") normalizedMethod = "tools/call";
+  if (!normalizedMethod) normalizedMethod = null;
+  
+  // Log minimal info (no secrets, no PHI)
+  console.log(`[MCP] ${new Date().toISOString()} - ${normalizedMethod || 'unknown'}`, {
+    hasId: requestId !== null,
+    idType: requestId !== null ? typeof requestId : null,
+    hasParams: requestParams !== null,
+    matched: normalizedMethod === 'tools/list' || normalizedMethod === 'tools/call' || normalizedMethod === 'initialize' || normalizedMethod === 'ping',
+  });
+  
+  // Handle initialize/ping methods (OpenAI Agent Builder might send these)
+  if (normalizedMethod === 'initialize' || normalizedMethod === 'ping') {
+    console.log(`[MCP] ✅ ${normalizedMethod} - responding with ok`);
+    return res.json({
+      jsonrpc: '2.0',
+      id: requestId,
+      result: { ok: true },
+    });
+  }
+  
+  // Handle tools/list (support multiple formats)
+  if (normalizedMethod === 'tools/list' || 
+      (!normalizedMethod && (!requestBody || Object.keys(requestBody).length === 0))) {
+    console.log(`[MCP] ✅ tools/list - returning ${Object.values(TOOLS).length} tools`);
+    const tools = Object.values(TOOLS).map(tool => ({
+      name: tool.name,
+      description: tool.description,
+      inputSchema: tool.inputSchema,
+    }));
+    
+    // Structured logging for tools/list
+    console.log(`[MCP] tools/list`, {
+      toolCount: tools.length,
+      toolNames: tools.map(t => t.name),
+    });
+    
+    return res.json({
+      jsonrpc: '2.0',
+      id: requestId,
+      result: { tools },
+    });
+  }
+  
+  // For other methods, require JSON-RPC 2.0 but be lenient
+  if (jsonrpc && jsonrpc !== '2.0') {
+    console.log(`[MCP] ❌ Invalid jsonrpc version: ${jsonrpc}`);
+    return res.json({
+      jsonrpc: '2.0',
+      id: requestId,
+      error: {
+        code: -32600,
+        message: 'Invalid Request: jsonrpc must be "2.0"',
+      },
+    });
+  }
+  
+  // If no method specified and not empty body, return error
+  if (!normalizedMethod && jsonrpc === '2.0') {
+    console.log(`[MCP] ❌ Missing method`);
+    return res.json({
+      jsonrpc: '2.0',
+      id: requestId,
+      error: {
+        code: -32600,
+        message: 'Invalid Request: method is required',
+      },
+    });
+  }
+  
+  // If not JSON-RPC 2.0 and not a recognized method, return error (but as JSON-RPC error, not HTTP 400)
+  if (!jsonrpc && normalizedMethod && normalizedMethod !== 'tools/list') {
+    console.log(`[MCP] ❌ Missing jsonrpc field`);
+    return res.json({
+      jsonrpc: '2.0',
+      id: requestId,
+      error: {
+        code: -32600,
+        message: 'Invalid Request: jsonrpc field is required',
+      },
+    });
+  }
+  
+  // Handle tools/call (support both "tools/call" and "tools.call")
+  if (normalizedMethod === 'tools/call') {
+    const { name, arguments: args } = requestParams || {};
+    
+    // Structured logging for tools/call (name + arg keys only, no values)
+    console.log(`[MCP] tools/call`, {
+      toolName: name || 'unknown',
+      hasName: !!name,
+      hasArgs: !!args,
+      argKeys: args ? Object.keys(args) : [],
+    });
+    
+    if (!name) {
+      return res.json({
+        jsonrpc: '2.0',
+        id: requestId,
+        error: {
+          code: -32602,
+          message: 'Invalid params: tool name required',
+        },
+      });
+    }
+    
+    const result = await handleTool(name, args || {});
+    
+    // Log result (minimal, no PHI)
+    if (result.error) {
+      console.log(`[MCP] tools/call - ${name} ERROR`, {
+        errorCode: result.status,
+      });
+    } else {
+      console.log(`[MCP] tools/call - ${name} SUCCESS`);
+    }
+    
+    if (result.error) {
+      const status = result.status || 500;
+      const errorCode = status === 400 ? -32602 : status === 401 || status === 403 ? -32001 : -32000;
+      
+      // Return safe error data (status and endpoint, not full payloads)
+      const safeData = {
+        status,
+        endpoint: result.details?.endpoint || name,
+      };
+      
+      // Return JSON-RPC error (not HTTP error status)
+      return res.json({
+        jsonrpc: '2.0',
+        id: requestId,
+        error: {
+          code: errorCode,
+          message: result.error,
+          data: safeData,
+        },
+      });
+    }
+    
+    return res.json({
+      jsonrpc: '2.0',
+      id: requestId,
+      result: {
+        content: [
+          {
+            type: 'json',
+            json: result,
+          },
+        ],
+      },
+    });
+  }
+  
+  // Unknown method - return JSON-RPC error (not HTTP 400)
+  console.log(`[MCP] ❌ Method not found: ${normalizedMethod}`);
   return res.json({
-    content: [{ type: "json", json: { mocked: true, endpoint, data: [] } }],
+    jsonrpc: '2.0',
+    id: requestId,
+    error: {
+      code: -32601,
+      message: `Method not found: ${normalizedMethod || 'unknown'}`,
+    },
   });
 }
 
-    const ghlRes = await fetch(
-      `https://rest.gohighlevel.com/v1${endpoint}`,
-      {
-        headers: {
-          Authorization: `Bearer ${process.env.GHL_API_KEY}`,
-          "Content-Type": "application/json",
-        },
+// JSON-RPC MCP handler - Compatible with OpenAI Agent Builder
+app.post('/mcp', requireApiKey, mcpPostHandler);
+
+// JSON-RPC MCP handler (alias)
+app.post('/api/mcp', requireApiKey, mcpPostHandler);
+
+// Error handler for JSON parse errors (must be after routes)
+app.use((err, req, res, next) => {
+  // Handle JSON parse errors specifically for /mcp and /api/mcp routes
+  if ((req.path === '/mcp' || req.path === '/api/mcp') && err instanceof SyntaxError && err.status === 400 && 'body' in err) {
+    console.log(`[MCP] JSON parse error`);
+    return res.json({
+      jsonrpc: '2.0',
+      id: null,
+      error: {
+        code: -32700,
+        message: 'Parse error',
+      },
+    });
+  }
+  // For other errors, pass to default handler
+  next(err);
+});
+
+// SSE MCP GET handler (shared)
+function mcpSseHandler(req, res) {
+  try {
+    const acceptHeader = req.headers.accept || '';
+    
+    if (!acceptHeader.includes('text/event-stream')) {
+      return res.status(405).json({
+        error: 'Method not allowed',
+        message: 'Use POST for JSON-RPC. GET requires Accept: text/event-stream',
+      });
+    }
+    
+    // Set SSE headers
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no'); // Disable nginx buffering
+    
+    // Send initial status
+    res.write(`event: status\n`);
+    res.write(`data: ${JSON.stringify({ ok: true })}\n\n`);
+    
+    // Send ping every 25 seconds
+    const pingInterval = setInterval(() => {
+      try {
+        res.write(`event: ping\n`);
+        res.write(`data: ${JSON.stringify({ ts: new Date().toISOString() })}\n\n`);
+      } catch (error) {
+        // Client disconnected
+        clearInterval(pingInterval);
       }
-    );
-
-    const data = await ghlRes.json();
-
-    res.json({
-      content: [{ type: "json", json: data }],
+    }, 25000);
+    
+    // Handle client disconnect
+    req.on('close', () => {
+      clearInterval(pingInterval);
+      res.end();
     });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Internal server error" });
-  }
-});
-// -----------------------
-// TASKS
-// -----------------------
-
-// List tasks (overdue/today/next7)
-app.post("/tools/tasks_list", async (req, res) => {
-  const { dueWindow = "today", limit = 25 } = req.body || {};
-  const safeLimit = Math.min(Math.max(Number(limit) || 25, 1), 50);
-
-  const allowed = new Set(["overdue", "today", "next7"]);
-  if (!allowed.has(dueWindow)) {
-    return res.status(400).json({ error: "dueWindow must be overdue|today|next7" });
-  }
-
-  if (isMock()) {
-    return mcpJson(res, {
-      dueWindow,
-      tasks: [
-        {
-          taskId: "mock_task_1",
-          title: "Call John Smith",
-          dueDateTime: "2026-01-12T10:00:00-05:00",
-          contactId: "mock_contact_abc123",
-          priority: "high"
-        },
-        {
-          taskId: "mock_task_2",
-          title: "Review pipeline report",
-          dueDateTime: "2026-01-12T16:00:00-05:00",
-          contactId: null,
-          priority: "normal"
-        }
-      ].slice(0, safeLimit)
+    
+    // Handle errors
+    req.on('error', (err) => {
+      clearInterval(pingInterval);
+      console.error('[MCP] SSE request error:', err);
     });
-  }
-
-  return res.status(501).json({ error: "Live OAuth not implemented yet" });
-});
-
-// Create a task
-app.post("/tools/tasks_create", async (req, res) => {
-  const { title, dueDateTime, contactId = null, priority = "normal" } = req.body || {};
-  if (!title || !dueDateTime) {
-    return res.status(400).json({ error: "title and dueDateTime required" });
-  }
-
-  if (isMock()) {
-    return mcpJson(res, {
-      taskId: "mock_task_" + Math.random().toString(36).slice(2, 8),
-      created: true,
-      title,
-      dueDateTime,
-      contactId,
-      priority
+    
+    res.on('error', (err) => {
+      clearInterval(pingInterval);
+      console.error('[MCP] SSE response error:', err);
     });
-  }
-
-  return res.status(501).json({ error: "Live OAuth not implemented yet" });
-});
-
-// Complete a task
-app.post("/tools/tasks_complete", async (req, res) => {
-  const { taskId } = req.body || {};
-  if (!taskId) return res.status(400).json({ error: "taskId required" });
-
-  if (isMock()) {
-    return mcpJson(res, { taskId, status: "completed" });
-  }
-
-  return res.status(501).json({ error: "Live OAuth not implemented yet" });
-});
-
-
-// -----------------------
-// PIPELINE SNAPSHOT (EXEC DASHBOARD)
-// -----------------------
-app.post("/tools/pipeline_snapshot", async (req, res) => {
-  const { pipelineType = "recruit" } = req.body || {};
-  const allowed = new Set(["recruit", "client"]);
-  if (!allowed.has(pipelineType)) {
-    return res.status(400).json({ error: "pipelineType must be recruit|client" });
-  }
-
-  if (isMock()) {
-    return mcpJson(res, {
-      pipelineType,
-      stageCounts: pipelineType === "recruit"
-        ? [
-            { stage: "New Lead", count: 12 },
-            { stage: "Intro Set", count: 5 },
-            { stage: "No Show", count: 2 },
-            { stage: "App Submitted", count: 3 }
-          ]
-        : [
-            { stage: "Inbound", count: 8 },
-            { stage: "Quoted", count: 4 },
-            { stage: "Policy In Force", count: 6 }
-          ]
-    });
-  }
-
-  return res.status(501).json({ error: "Live OAuth not implemented yet" });
-});
-// -----------------------
-// CONVERSATIONS (Outlook inside GHL)
-// -----------------------
-// ACTION — Messaging (send into an existing thread)
-app.post("/tools/conversations_send_message", async (req, res) => {
-  try {
-    const { threadId, message, channel } = req.body || {};
-    if (!threadId || !message) {
-      return res.status(400).json({ ok: false, error: "threadId and message are required" });
-    }
-
-    // MOCK behavior
-    if (isMock()) {
-      return res.json({
-        ok: true,
-        mode: "mock",
-        threadId,
-        channel: channel || "sms",
-        messageId: `msg_mock_${Date.now()}`,
-        status: "sent"
+  } catch (error) {
+    console.error('[MCP] SSE handler error:', error);
+    if (!res.headersSent) {
+      res.status(500).json({
+        error: 'Internal server error',
+        message: 'Failed to establish SSE connection',
       });
     }
-
-    // LIVE placeholder (to wire after OAuth)
-    return res.status(501).json({ ok: false, error: "Live conversations_send_message not implemented yet" });
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: e?.message || String(e) });
   }
-});
+}
 
-// ACTION — Workflows (trigger a workflow by ID)
-app.post("/tools/workflow_trigger", async (req, res) => {
-  try {
-    const { workflowId, contactId, payload } = req.body || {};
-    if (!workflowId) {
-      return res.status(400).json({ ok: false, error: "workflowId is required" });
+// SSE MCP status stream
+app.get('/mcp', requireApiKey, mcpSseHandler);
+
+// SSE MCP status stream (alias)
+app.get('/api/mcp', requireApiKey, mcpSseHandler);
+
+// ============================================================================
+// Error Handling
+// ============================================================================
+
+app.use((err, req, res, next) => {
+  console.error('[server] Unhandled error:', err);
+  
+  // Don't send JSON if headers already sent (e.g., SSE stream)
+  if (res.headersSent) {
+    return next(err);
+  }
+  
+  // Check if this is an SSE request that failed
+  const isSSE = req.path === '/mcp' || req.path === '/api/mcp';
+  const isGET = req.method === 'GET';
+  const wantsSSE = req.headers.accept && req.headers.accept.includes('text/event-stream');
+  
+  if (isSSE && isGET && wantsSSE) {
+    // For SSE errors, try to send error event
+    try {
+      res.write(`event: error\n`);
+      res.write(`data: ${JSON.stringify({ error: 'Internal server error', message: 'An unexpected error occurred' })}\n\n`);
+      res.end();
+      return;
+    } catch (writeError) {
+      // If write fails, connection is likely closed
+      return;
     }
+  }
+  
+  res.status(500).json({
+    error: 'Internal server error',
+    message: 'An unexpected error occurred',
+  });
+});
 
-    // MOCK behavior
-    if (isMock()) {
-      return res.json({
-        ok: true,
-        mode: "mock",
-        workflowId,
-        contactId: contactId || null,
-        triggered: true,
-        payload: payload || null
-      });
-    }
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({
+    error: 'Not found',
+    path: req.path,
+  });
+});
 
-    // LIVE placeholder (to wire after OAuth)
-    return res.status(501).json({ ok: false, error: "Live workflow_trigger not implemented yet" });
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: e?.message || String(e) });
+// ============================================================================
+// Start Server
+// ============================================================================
+
+const PORT = process.env.PORT || 3000;
+const HOST = process.env.HOST || '0.0.0.0';
+
+app.listen(PORT, HOST, () => {
+  // Re-read env vars at startup to ensure they're loaded
+  const pitToken = process.env.GHL_PIT_TOKEN;
+  const locationId = process.env.GHL_LOCATION_ID;
+  const mcpKey = process.env.MCP_API_KEY;
+  
+  console.log(`[GHL MCP Gateway] Server listening on ${HOST}:${PORT}`);
+  console.log(`[GHL MCP Gateway] API Base: ${GHL_API_BASE}`);
+  console.log(`[GHL MCP Gateway] API Version: ${GHL_API_VERSION}`);
+  console.log(`[GHL MCP Gateway] Location ID: ${locationId ? '***' + locationId.slice(-4) : 'NOT SET'}`);
+  console.log(`[GHL MCP Gateway] PIT Token: ${pitToken ? 'SET' : 'NOT SET'}`);
+  console.log(`[GHL MCP Gateway] MCP API Key: ${mcpKey ? 'SET' : 'NOT SET'}`);
+  
+  // Log missing keys if any
+  const missing = [];
+  if (!pitToken) missing.push('GHL_PIT_TOKEN');
+  if (!locationId) missing.push('GHL_LOCATION_ID');
+  if (!mcpKey) missing.push('MCP_API_KEY');
+  
+  if (missing.length > 0) {
+    console.warn(`[GHL MCP Gateway] ⚠️  Missing environment variables: ${missing.join(', ')}`);
+  } else {
+    console.log(`[GHL MCP Gateway] ✅ All required environment variables loaded`);
   }
 });
 
-// List threads (unread emails, recent activity)
-app.post("/tools/conversations_list_threads", async (req, res) => {
-  const {
-    channel = "email",        // "email" | "sms" (keep tight)
-    unreadOnly = true,
-    limit = 20
-  } = req.body || {};
-
-  const allowedChannels = new Set(["email", "sms"]);
-  if (!allowedChannels.has(channel)) {
-    return res.status(400).json({ error: "channel must be email|sms" });
-  }
-
-  const safeLimit = Math.min(Math.max(Number(limit) || 20, 1), 50);
-
-  if (isMock()) {
-    return mcpJson(res, {
-      channel,
-      unreadOnly,
-      threads: [
-        {
-          threadId: "mock_thread_1",
-          contactId: "mock_contact_abc123",
-          lastMessageAt: "2026-01-12T09:12:00-05:00",
-          unreadCount: unreadOnly ? 1 : 0,
-          snippet: "Can we move tomorrow’s call to 4pm?"
-        },
-        {
-          threadId: "mock_thread_2",
-          contactId: "mock_contact_def456",
-          lastMessageAt: "2026-01-12T08:41:00-05:00",
-          unreadCount: unreadOnly ? 1 : 0,
-          snippet: "Thanks Bill — what’s the next step?"
-        }
-      ].slice(0, safeLimit)
-    });
-  }
-
-  return res.status(501).json({ error: "Live OAuth not implemented yet" });
-});
-
-// Get a specific thread (for summarization)
-app.post("/tools/conversations_get_thread", async (req, res) => {
-  const { threadId, limitMessages = 10 } = req.body || {};
-  if (!threadId) return res.status(400).json({ error: "threadId required" });
-
-  const safeLimit = Math.min(Math.max(Number(limitMessages) || 10, 1), 20);
-
-  if (isMock()) {
-    const messages = [
-      { at: "2026-01-12T09:12:00-05:00", from: "contact", text: "Can we move tomorrow’s call to 4pm?" },
-      { at: "2026-01-12T09:15:00-05:00", from: "bill", text: "Yes—4pm works. I’ll send an updated invite." }
-    ].slice(0, safeLimit);
-
-    return mcpJson(res, { threadId, messages });
-  }
-
-  return res.status(501).json({ error: "Live OAuth not implemented yet" });
-});
-
-
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`MCP server running on port ${PORT}`);
-});
-
-
-
-
-
-
-
-
-
+module.exports = app;
