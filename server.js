@@ -835,6 +835,24 @@ async function handleConversationsSendMessage(args) {
 // Tool Registry
 // ============================================================================
 
+// Strict allowlist: Only tools matching GHL Private Integration scopes
+// Defense-in-depth: Even if a tool is accidentally added to TOOLS, it won't be exposed
+const ALLOWED_TOOLS = new Set([
+  'contacts_search',
+  'contacts_upsert',
+  'contacts_update_status',
+  'calendar_list_appointments',
+  'calendar_create_appointment',
+  'calendar_reschedule_appointment',
+  'calendar_cancel_appointment',
+  'conversations_list_threads',
+  'conversations_get_thread',
+  'conversations_send_message',
+  'tasks_list',
+  'tasks_create',
+  'tasks_complete',
+]);
+
 const TOOLS = {
   contacts_search: {
     name: 'contacts_search',
@@ -1038,6 +1056,18 @@ const TOOLS = {
 // ============================================================================
 
 async function handleTool(toolName, args) {
+  // Strict allowlist check: reject tools not in ALLOWED_TOOLS
+  if (!ALLOWED_TOOLS.has(toolName)) {
+    return {
+      error: `Tool not available: ${toolName} is not in the allowed tool catalog`,
+      status: 404,
+      details: {
+        endpoint: toolName,
+        status: 404,
+      },
+    };
+  }
+  
   const tool = TOOLS[toolName];
   
   if (!tool) {
@@ -1129,22 +1159,28 @@ app.get('/api/mcp/health', (req, res) => {
 // Tool manifest endpoint (GET) - for Agent Builder discovery
 // Returns same format as tools/list JSON-RPC response
 app.get('/api/mcp/tools', requireApiKey, (req, res) => {
-  const tools = Object.values(TOOLS).map(tool => ({
-    name: tool.name,
-    description: tool.description,
-    inputSchema: tool.inputSchema,
-  }));
+  // Strict allowlist filter: only expose tools in ALLOWED_TOOLS
+  const tools = Object.values(TOOLS)
+    .filter(tool => ALLOWED_TOOLS.has(tool.name))
+    .map(tool => ({
+      name: tool.name,
+      description: tool.description,
+      inputSchema: tool.inputSchema,
+    }));
   
   res.json({ tools });
 });
 
 // Tool manifest endpoint (GET) - alias for /mcp/tools
 app.get('/mcp/tools', requireApiKey, (req, res) => {
-  const tools = Object.values(TOOLS).map(tool => ({
-    name: tool.name,
-    description: tool.description,
-    inputSchema: tool.inputSchema,
-  }));
+  // Strict allowlist filter: only expose tools in ALLOWED_TOOLS
+  const tools = Object.values(TOOLS)
+    .filter(tool => ALLOWED_TOOLS.has(tool.name))
+    .map(tool => ({
+      name: tool.name,
+      description: tool.description,
+      inputSchema: tool.inputSchema,
+    }));
   
   res.json({ tools });
 });
@@ -1224,17 +1260,21 @@ async function mcpPostHandler(req, res) {
   // Handle tools/list (support multiple formats)
   if (normalizedMethod === 'tools/list' || 
       (!normalizedMethod && (!requestBody || Object.keys(requestBody).length === 0))) {
-    console.log(`[MCP] ✅ tools/list - returning ${Object.values(TOOLS).length} tools`);
-    const tools = Object.values(TOOLS).map(tool => ({
-      name: tool.name,
-      description: tool.description,
-      inputSchema: tool.inputSchema,
-    }));
+    // Strict allowlist filter: only expose tools in ALLOWED_TOOLS
+    const allTools = Object.values(TOOLS);
+    const tools = allTools
+      .filter(tool => ALLOWED_TOOLS.has(tool.name))
+      .map(tool => ({
+        name: tool.name,
+        description: tool.description,
+        inputSchema: tool.inputSchema,
+      }));
     
     // Structured logging for tools/list
     console.log(`[MCP] tools/list`, {
       toolCount: tools.length,
       toolNames: tools.map(t => t.name),
+      filteredOut: allTools.filter(t => !ALLOWED_TOOLS.has(t.name)).map(t => t.name),
     });
     
     return res.json({
