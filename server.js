@@ -1247,15 +1247,34 @@ async function mcpPostHandler(req, res) {
     matched: normalizedMethod === 'tools/list' || normalizedMethod === 'tools/call' || normalizedMethod === 'initialize' || normalizedMethod === 'ping',
   });
   
-  // Handle initialize/ping methods (OpenAI Agent Builder might send these)
-  if (normalizedMethod === 'initialize' || normalizedMethod === 'ping') {
-    console.log(`[MCP] ✅ ${normalizedMethod} - responding with ok`);
-    return res.json({
-      jsonrpc: '2.0',
-      id: requestId,
-      result: { ok: true },
-    });
-  }
+// initialize (Agent Builder handshake)
+if (normalizedMethod === "initialize") {
+  const params =
+    requestParams ||
+    (requestBody && requestBody.params) ||
+    {};
+
+  const protocolVersion = params.protocolVersion || "2024-11-05";
+
+  const result = {
+    protocolVersion,
+    capabilities: {
+      tools: {},
+      prompts: {},
+      resources: {}
+    },
+    serverInfo: {
+      name: "ghl-mcp-gateway",
+      version: "1.0.0"
+    }
+  };
+
+  return res.json({
+    jsonrpc: "2.0",
+    id: requestId ?? null,
+    result
+  });
+}
   
   // Handle tools/list (support multiple formats)
   if (normalizedMethod === 'tools/list' || 
