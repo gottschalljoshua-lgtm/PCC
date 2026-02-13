@@ -749,7 +749,7 @@ async function handleConversationsListThreads(args) {
   
   if (limit) query.limit = limit;
 
-  const result = await ghlRequest('GET', `/conversations`, {
+  const result = await ghlRequest('GET', `/conversations/search`, {
     query,
   });
 
