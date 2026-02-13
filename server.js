@@ -849,9 +849,13 @@ async function handleConversationsSendNewEmail(args) {
   }
 
   const messageData = {
-    locationId: locId,
+    locationId: locId,  
+    type: 'Email',
     message,
-    channel: 'email',
+    body: message,
+    html: message,
+    channel:
+  'email',
   };
 
   if (contactId) messageData.contactId = contactId;
