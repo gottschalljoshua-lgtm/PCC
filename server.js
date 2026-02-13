@@ -830,6 +830,45 @@ async function handleConversationsSendMessage(args) {
   return { message: result.data?.message || result.data };
 }
 
+/**
+ * Start a new email thread (outbound email)
+ */
+async function handleConversationsSendNewEmail(args) {
+  const { contactId, message, subject, email, locationId } = args;
+
+  if (!contactId && !email) {
+    return { error: 'contactId or email is required', status: 400 };
+  }
+  if (!message) {
+    return { error: 'message is required', status: 400 };
+  }
+
+  const locId = locationId || GHL_LOCATION_ID;
+  if (!locId) {
+    return { error: 'locationId is required', status: 400 };
+  }
+
+  const messageData = {
+    locationId: locId,
+    message,
+    channel: 'email',
+  };
+
+  if (contactId) messageData.contactId = contactId;
+  if (email) messageData.email = email;
+  if (subject) messageData.subject = subject;
+
+  const result = await ghlRequest('POST', `/conversations/messages`, {
+    body: messageData,
+  });
+
+  if (!result.ok) {
+    return { error: result.error, status: result.status, details: result.details };
+  }
+
+  return { message: result.data?.message || result.data };
+}
+
 
 // ============================================================================
 // Tool Registry
@@ -848,6 +887,7 @@ const ALLOWED_TOOLS = new Set([
   'conversations_list_threads',
   'conversations_get_thread',
   'conversations_send_message',
+  'conversations_send_new_email',
   'tasks_list',
   'tasks_create',
   'tasks_complete',
@@ -1048,6 +1088,23 @@ const TOOLS = {
       required: ['threadId', 'message'],
     },
     handler: handleConversationsSendMessage,
+  },
+  conversations_send_new_email: {
+    name: 'conversations_send_new_email',
+    description: 'Start a new email thread (outbound email)',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        contactId: { type: 'string' },
+        email: { type: 'string' },
+        subject: { type: 'string' },
+        message: { type: 'string' },
+        locationId: { type: 'string' },
+      },
+      required: ['message'],
+    },
+    handler: handleConversationsSendNewEmail,
   },
 };
 
