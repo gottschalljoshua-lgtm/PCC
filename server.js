@@ -548,23 +548,22 @@ async function handleCalendarListAppointments(args) {
   }
 
   const query = {
-    locationId: locId,
     calendarId,
-    startTime: startDateTime,
-    endTime: endDateTime,
+    startDate: startDateTime,
+    endDate: endDateTime,
   };
-
+  if (locId) query.locationId = locId;
   if (limit) query.limit = limit;
 
-  const result = await ghlRequest('POST', `/calendars/events/appointments`, {
-    body: query,
+  const result = await ghlRequest('GET', `/calendars/events`, {
+    query,
   });
 
   if (!result.ok) {
     return { error: result.error, status: result.status, details: result.details };
   }
 
-  return { appointments: result.data?.appointments || result.data || [] };
+  return { events: result.data?.events || result.data || [] };
 }
 
 /**
