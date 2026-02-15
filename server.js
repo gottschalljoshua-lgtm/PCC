@@ -550,8 +550,8 @@ async function handleCalendarListAppointments(args) {
   const query = {
     locationId: locId,
     calendarId,
-    startDate: startDateTime,
-    endDate: endDateTime,
+    startTime: startDateTime,
+    endTime: endDateTime,
   };
 
   if (limit) query.limit = limit;
