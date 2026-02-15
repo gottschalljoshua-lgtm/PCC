@@ -460,6 +460,73 @@ async function handleContactsUpdateStatus(args) {
 }
 
 /**
+ * List calendars for a location
+ */
+async function handleCalendarsList(args) {
+  const { locationId } = args || {};
+  const locId = locationId || GHL_LOCATION_ID;
+  if (!locId) {
+    return { error: "locationId is required", status: 400 };
+  }
+
+  const result = await ghlRequest("GET", "/calendars/", {
+    query: { locationId: locId },
+  });
+
+  if (!result.ok) {
+    return { error: result.error, status: result.status, details: result.details };
+  }
+
+  return { calendars: result.data?.calendars || result.data || [] };
+}
+
+/**
+ * List free slots for a calendar between dates
+ */
+async function handleCalendarFreeSlots(args) {
+  const { calendarId, startDateTime, endDateTime, timezone, locationId } = args || {};
+
+  if (!calendarId) {
+    return { error: 'calendarId is required', status: 400 };
+  }
+  if (!startDateTime) {
+    return { error: 'startDateTime is required', status: 400 };
+  }
+  if (!endDateTime) {
+    return { error: 'endDateTime is required', status: 400 };
+  }
+
+  const locId = locationId || GHL_LOCATION_ID;
+  if (!locId) {
+    return { error: 'locationId is required', status: 400 };
+  }
+
+  const startMs = Date.parse(startDateTime);
+  const endMs = Date.parse(endDateTime);
+  if (Number.isNaN(startMs) || Number.isNaN(endMs)) {
+    return { error: 'startDateTime and endDateTime must be valid ISO strings', status: 400 };
+  }
+
+  const query = {
+    startDate: startMs,
+    endDate: endMs,
+  };
+  if (timezone) {
+    query.timezone = timezone;
+  }
+
+  const result = await ghlRequest('GET', '/calendars/' + calendarId + '/free-slots', {
+    query,
+  });
+
+  if (!result.ok) {
+    return { error: result.error, status: result.status, details: result.details };
+  }
+
+  return { slots: result.data?.slots || result.data || [] };
+}
+
+/**
  * List appointments for a calendar between dates
  */
 async function handleCalendarListAppointments(args) {
@@ -489,8 +556,8 @@ async function handleCalendarListAppointments(args) {
 
   if (limit) query.limit = limit;
 
-  const result = await ghlRequest('GET', `/calendars/${calendarId}/appointments`, {
-    query,
+  const result = await ghlRequest('POST', `/calendars/events/appointments`, {
+    body: query,
   });
 
   if (!result.ok) {
@@ -526,6 +593,7 @@ async function handleCalendarCreateAppointment(args) {
     contactId,
     title,
     notes,
+    locationId: locId,
     ...otherFields,
   };
   
@@ -849,13 +917,12 @@ async function handleConversationsSendNewEmail(args) {
   }
 
   const messageData = {
-    locationId: locId,  
+    locationId: locId,
     type: 'Email',
     message,
     body: message,
     html: message,
-    channel:
-  'email',
+    channel: 'email',
   };
 
   if (contactId) messageData.contactId = contactId;
@@ -884,6 +951,8 @@ const ALLOWED_TOOLS = new Set([
   'contacts_search',
   'contacts_upsert',
   'contacts_update_status',
+  'calendars_list',
+  'calendar_free_slots',
   'calendar_list_appointments',
   'calendar_create_appointment',
   'calendar_reschedule_appointment',
@@ -946,6 +1015,36 @@ const TOOLS = {
     },
     handler: handleContactsUpdateStatus,
   },
+  calendars_list: {
+    name: "calendars_list",
+    description: "List calendars for a location",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        locationId: { type: "string" },
+      },
+    },
+    handler: handleCalendarsList,
+  },
+  calendar_free_slots: {
+    name: "calendar_free_slots",
+    description: "List available free slots for a calendar",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        calendarId: { type: "string" },
+        startDateTime: { type: "string" },
+        endDateTime: { type: "string" },
+        timezone: { type: "string" },
+        locationId: { type: "string" },
+      },
+      required: ["calendarId", "startDateTime", "endDateTime"],
+    },
+    handler: handleCalendarFreeSlots,
+  },
+
   calendar_list_appointments: {
     name: 'calendar_list_appointments',
     description: 'List appointments in a calendar window',
