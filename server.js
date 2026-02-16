@@ -764,6 +764,8 @@ async function handleConversationsReport(args) {
     return { report: result.data || {} };
   }
 
+  let lastError = { error: result.error, status: result.status, details: result.details };
+
   const shouldRetryDates = result.status === 400 && (startDate || endDate);
   if (shouldRetryDates) {
     const normalizeDate = (value, isEnd = false) => {
@@ -815,7 +817,7 @@ async function handleConversationsReport(args) {
         return { report: alt.data || {}, _retry: true, _format: 'epoch_ms_start_end', _endpoint: endpoint };
       }
     }
-    return { error: retry2.error, status: retry2.status, details: retry2.details };
+    lastError = { error: retry2.error, status: retry2.status, details: retry2.details };
   }
 
   // Final fallback: build a lightweight report from conversations search (available in API)
@@ -848,7 +850,7 @@ async function handleConversationsReport(args) {
     };
   }
 
-  return { error: result.error, status: result.status, details: result.details };
+  return lastError;
 }
 
 /**
