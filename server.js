@@ -805,6 +805,14 @@ async function handleConversationsReport(args) {
     if (retry2.ok) {
       return { report: retry2.data || {}, _retry: true, _format: 'epoch_ms_start_end' };
     }
+    // If GHL treats "reports" as a conversation id, try alternate report endpoints.
+    const endpoints = ['/conversations/report', '/conversations/reports/summary'];
+    for (const endpoint of endpoints) {
+      const alt = await ghlRequest('GET', endpoint, { query: altQuery2 });
+      if (alt.ok) {
+        return { report: alt.data || {}, _retry: true, _format: 'epoch_ms_start_end', _endpoint: endpoint };
+      }
+    }
     return { error: retry2.error, status: retry2.status, details: retry2.details };
   }
 
