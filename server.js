@@ -240,14 +240,21 @@ async function ghlRequest(method, path, options = {}) {
         errorMessage = data;
       }
       
+      const safeDetails = {
+        endpoint: path,
+        status: response.status,
+      };
+      if (typeof data === 'object' && data !== null) {
+        safeDetails.response = data;
+      } else if (typeof data === 'string' && data.length <= 2000) {
+        safeDetails.response = data;
+      }
+
       return {
         ok: false,
         status: response.status,
         error: errorMessage,
-        details: {
-          endpoint: path,
-          status: response.status,
-        },
+        details: safeDetails,
       };
     }
 
@@ -782,7 +789,23 @@ async function handleConversationsReport(args) {
     if (retry.ok) {
       return { report: retry.data || {}, _retry: true, _format: 'epoch_ms' };
     }
-    return { error: retry.error, status: retry.status, details: retry.details };
+    // Second retry: some GHL endpoints expect `start`/`end` instead of `startDate`/`endDate`
+    const altQuery2 = { locationId: locId };
+    if (startIso) {
+      const ms = Date.parse(startIso);
+      if (!Number.isNaN(ms)) altQuery2.start = ms;
+    }
+    if (endIso) {
+      const ms = Date.parse(endIso);
+      if (!Number.isNaN(ms)) altQuery2.end = ms;
+    }
+    if (timezone) altQuery2.timezone = timezone;
+
+    const retry2 = await ghlRequest('GET', `/conversations/reports`, { query: altQuery2 });
+    if (retry2.ok) {
+      return { report: retry2.data || {}, _retry: true, _format: 'epoch_ms_start_end' };
+    }
+    return { error: retry2.error, status: retry2.status, details: retry2.details };
   }
 
   return { error: result.error, status: result.status, details: result.details };
