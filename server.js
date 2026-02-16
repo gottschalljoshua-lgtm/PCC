@@ -748,7 +748,7 @@ async function handleLocationsTagsDelete(args) {
  * Conversations reports (summary)
  */
 async function handleConversationsReport(args) {
-  const { locationId, startDate, endDate, timezone } = args;
+  const { locationId, startDate, endDate, timezone, limit, channel } = args;
   const locId = locationId || GHL_LOCATION_ID;
   if (!locId) return { error: 'locationId is required', status: 400 };
 
@@ -756,14 +756,16 @@ async function handleConversationsReport(args) {
   if (startDate) query.startDate = startDate;
   if (endDate) query.endDate = endDate;
   if (timezone) query.timezone = timezone;
+  if (limit) query.limit = limit;
+  if (channel && ['email', 'sms'].includes(channel)) query.channel = channel;
 
   const result = await ghlRequest('GET', `/conversations/reports`, { query });
   if (result.ok) {
     return { report: result.data || {} };
   }
 
-  // Retry with epoch-milliseconds if the API rejects plain date strings.
-  if (result.status === 400 && (startDate || endDate)) {
+  const shouldRetryDates = result.status === 400 && (startDate || endDate);
+  if (shouldRetryDates) {
     const normalizeDate = (value, isEnd = false) => {
       if (!value || typeof value !== 'string') return value;
       if (/^\d{4}-\d{2}-\d{2}$/.test(value)) {
@@ -814,6 +816,36 @@ async function handleConversationsReport(args) {
       }
     }
     return { error: retry2.error, status: retry2.status, details: retry2.details };
+  }
+
+  // Final fallback: build a lightweight report from conversations search (available in API)
+  const searchQuery = { locationId: locId };
+  if (limit) searchQuery.limit = limit;
+  if (channel && ['email', 'sms'].includes(channel)) searchQuery.channel = channel;
+  const search = await ghlRequest('GET', `/conversations/search`, { query: searchQuery });
+  if (search.ok) {
+    const conversations = search.data?.conversations || search.data || [];
+    const byChannel = {};
+    const byStatus = {};
+    let unread = 0;
+    for (const convo of conversations) {
+      const c = convo || {};
+      const ch = c.channel || c.type || 'unknown';
+      byChannel[ch] = (byChannel[ch] || 0) + 1;
+      const st = c.status || 'unknown';
+      byStatus[st] = (byStatus[st] || 0) + 1;
+      if (c.unreadCount > 0 || c.unread === true) unread += 1;
+    }
+    return {
+      report: {
+        total: conversations.length,
+        unread,
+        byChannel,
+        byStatus,
+        sample: conversations.slice(0, 5),
+      },
+      _fallback: 'conversations_search',
+    };
   }
 
   return { error: result.error, status: result.status, details: result.details };
@@ -1284,7 +1316,7 @@ const TOOLS = {
   },
   conversations_report: {
     name: 'conversations_report',
-    description: 'Get conversations report summary for a location',
+    description: 'Get conversations report summary for a location (uses API report if available, otherwise derives from conversations search)',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -1293,6 +1325,8 @@ const TOOLS = {
         startDate: { type: 'string' },
         endDate: { type: 'string' },
         timezone: { type: 'string' },
+        limit: { type: 'number' },
+        channel: { type: 'string', enum: ['email', 'sms'] },
       },
       required: [],
     },
