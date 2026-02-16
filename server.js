@@ -689,6 +689,75 @@ async function handleCalendarCancelAppointment(args) {
 }
 
 /**
+ * List location tags
+ */
+async function handleLocationsTagsList(args) {
+  const { locationId } = args;
+  const locId = locationId || GHL_LOCATION_ID;
+  if (!locId) return { error: 'locationId is required', status: 400 };
+
+  const result = await ghlRequest('GET', `/locations/${locId}/tags`, {});
+  if (!result.ok) {
+    return { error: result.error, status: result.status, details: result.details };
+  }
+  return { tags: result.data?.tags || result.data || [] };
+}
+
+/**
+ * Create a tag for a location
+ */
+async function handleLocationsTagsCreate(args) {
+  const { locationId, name } = args;
+  const locId = locationId || GHL_LOCATION_ID;
+  if (!locId) return { error: 'locationId is required', status: 400 };
+  if (!name) return { error: 'name is required', status: 400 };
+
+  const result = await ghlRequest('POST', `/locations/${locId}/tags`, {
+    body: { name },
+  });
+  if (!result.ok) {
+    return { error: result.error, status: result.status, details: result.details };
+  }
+  return { tag: result.data || null };
+}
+
+/**
+ * Delete a tag by id for a location
+ */
+async function handleLocationsTagsDelete(args) {
+  const { locationId, tagId } = args;
+  const locId = locationId || GHL_LOCATION_ID;
+  if (!locId) return { error: 'locationId is required', status: 400 };
+  if (!tagId) return { error: 'tagId is required', status: 400 };
+
+  const result = await ghlRequest('DELETE', `/locations/${locId}/tags/${tagId}`, {});
+  if (!result.ok) {
+    return { error: result.error, status: result.status, details: result.details };
+  }
+  return { success: true };
+}
+
+/**
+ * Conversations reports (summary)
+ */
+async function handleConversationsReport(args) {
+  const { locationId, startDate, endDate, timezone } = args;
+  const locId = locationId || GHL_LOCATION_ID;
+  if (!locId) return { error: 'locationId is required', status: 400 };
+
+  const query = { locationId: locId };
+  if (startDate) query.startDate = startDate;
+  if (endDate) query.endDate = endDate;
+  if (timezone) query.timezone = timezone;
+
+  const result = await ghlRequest('GET', `/conversations/reports`, { query });
+  if (!result.ok) {
+    return { error: result.error, status: result.status, details: result.details };
+  }
+  return { report: result.data || {} };
+}
+
+/**
  * List tasks
  */
 async function handleTasksList(args) {
@@ -960,6 +1029,10 @@ const ALLOWED_TOOLS = new Set([
   'conversations_get_thread',
   'conversations_send_message',
   'conversations_send_new_email',
+  'conversations_report',
+  'locations_tags_list',
+  'locations_tags_create',
+  'locations_tags_delete',
   'tasks_list',
   'tasks_create',
   'tasks_complete',
@@ -1105,6 +1178,63 @@ const TOOLS = {
       required: ['appointmentId'],
     },
     handler: handleCalendarCancelAppointment,
+  },
+  locations_tags_list: {
+    name: 'locations_tags_list',
+    description: 'List tags for a location',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        locationId: { type: 'string' },
+      },
+      required: [],
+    },
+    handler: handleLocationsTagsList,
+  },
+  locations_tags_create: {
+    name: 'locations_tags_create',
+    description: 'Create a tag for a location',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        locationId: { type: 'string' },
+        name: { type: 'string' },
+      },
+      required: ['name'],
+    },
+    handler: handleLocationsTagsCreate,
+  },
+  locations_tags_delete: {
+    name: 'locations_tags_delete',
+    description: 'Delete a tag for a location',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        locationId: { type: 'string' },
+        tagId: { type: 'string' },
+      },
+      required: ['tagId'],
+    },
+    handler: handleLocationsTagsDelete,
+  },
+  conversations_report: {
+    name: 'conversations_report',
+    description: 'Get conversations report summary for a location',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        locationId: { type: 'string' },
+        startDate: { type: 'string' },
+        endDate: { type: 'string' },
+        timezone: { type: 'string' },
+      },
+      required: [],
+    },
+    handler: handleConversationsReport,
   },
   tasks_list: {
     name: 'tasks_list',
