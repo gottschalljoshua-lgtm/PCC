@@ -1728,6 +1728,11 @@ if (normalizedMethod === "initialize") {
         status,
         endpoint: result.details?.endpoint || name,
       };
+
+      // For diagnostics on reports endpoint, include upstream error payload (non-PII).
+      if (result.details?.endpoint === '/conversations/reports' && result.details?.response) {
+        safeData.response = result.details.response;
+      }
       
       // Return JSON-RPC error (not HTTP error status)
       return res.json({
