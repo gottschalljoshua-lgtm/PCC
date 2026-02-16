@@ -751,10 +751,41 @@ async function handleConversationsReport(args) {
   if (timezone) query.timezone = timezone;
 
   const result = await ghlRequest('GET', `/conversations/reports`, { query });
-  if (!result.ok) {
-    return { error: result.error, status: result.status, details: result.details };
+  if (result.ok) {
+    return { report: result.data || {} };
   }
-  return { report: result.data || {} };
+
+  // Retry with epoch-milliseconds if the API rejects plain date strings.
+  if (result.status === 400 && (startDate || endDate)) {
+    const normalizeDate = (value, isEnd = false) => {
+      if (!value || typeof value !== 'string') return value;
+      if (/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+        return isEnd ? `${value}T23:59:59.999Z` : `${value}T00:00:00.000Z`;
+      }
+      return value;
+    };
+
+    const altQuery = { locationId: locId };
+    const startIso = normalizeDate(startDate, false);
+    const endIso = normalizeDate(endDate, true);
+    if (startIso) {
+      const ms = Date.parse(startIso);
+      if (!Number.isNaN(ms)) altQuery.startDate = ms;
+    }
+    if (endIso) {
+      const ms = Date.parse(endIso);
+      if (!Number.isNaN(ms)) altQuery.endDate = ms;
+    }
+    if (timezone) altQuery.timezone = timezone;
+
+    const retry = await ghlRequest('GET', `/conversations/reports`, { query: altQuery });
+    if (retry.ok) {
+      return { report: retry.data || {}, _retry: true, _format: 'epoch_ms' };
+    }
+    return { error: retry.error, status: retry.status, details: retry.details };
+  }
+
+  return { error: result.error, status: result.status, details: result.details };
 }
 
 /**
