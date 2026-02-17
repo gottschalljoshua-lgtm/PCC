@@ -60,6 +60,7 @@ if (dotenvResult.error) {
 
 const express = require('express');
 const cors = require('cors');
+const crypto = require('crypto');
 
 const app = express();
 
@@ -69,6 +70,10 @@ const app = express();
 
 // Read env vars AFTER dotenv load (runtime getters, no caching)
 const MCP_API_KEY = process.env.MCP_API_KEY;
+const DRY_RUN = process.env.DRY_RUN === '1';
+const ENABLE_OAUTH = process.env.ENABLE_OAUTH === '1';
+const ENABLE_LEGACY_TOOLS = process.env.ENABLE_LEGACY_TOOLS === '1';
+const PROPOSAL_TTL_MS = Number(process.env.PROPOSAL_TTL_MS || 5 * 60 * 1000);
 const GHL_PIT_TOKEN = process.env.GHL_PIT_TOKEN;
 const GHL_LOCATION_ID = process.env.GHL_LOCATION_ID;
 const GHL_API_BASE = process.env.GHL_API_BASE || 'https://services.leadconnectorhq.com';
@@ -121,14 +126,10 @@ function requireApiKey(req, res, next) {
     authMethod = 'query-param';
   }
   
-  // Log auth attempt for debugging
+  // Log auth attempt (no sensitive data)
   console.log(`[MCP] Auth check:`, {
     authMethod,
     hasProvidedKey: !!providedKey,
-    providedKeyLength: providedKey?.length || 0,
-    providedKeyPreview: providedKey ? `${providedKey.slice(0, 6)}...${providedKey.slice(-4)}` : 'NONE',
-    expectedKeyLength: MCP_API_KEY?.length || 0,
-    expectedKeyPreview: MCP_API_KEY ? `${MCP_API_KEY.slice(0, 6)}...${MCP_API_KEY.slice(-4)}` : 'NOT SET',
     match: providedKey === MCP_API_KEY,
   });
   
@@ -158,6 +159,205 @@ function requireApiKey(req, res, next) {
   
   console.log(`[MCP] ✅ Auth successful (method: ${authMethod})`);
   next();
+}
+
+// ============================================================================
+// PHI/PII/PFI Firewall
+// ============================================================================
+
+const CREDIT_CARD_PATTERN = /\b(?:\d[ -]*?){13,19}\b/;
+const DOB_KEYWORDS = ['dob', 'date of birth', 'birth date', 'born'];
+const SSN_KEYWORDS = ['ssn', 'social security', 'social security number'];
+const DOB_DATE_PATTERN = /\b\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}\b/;
+const SSN_NUMBER_PATTERN = /\b\d{3}-\d{2}-\d{4}\b|\b\d{9}\b/;
+const PHI_PATTERNS = [
+  CREDIT_CARD_PATTERN, // Credit card (strict)
+  /\bpolicy\s*#?\s*\d+\b/i,
+  /\bdriver'?s\s*license\b/i,
+  /\bpassport\b/i,
+  /\bmedical\b|\bdiagnos(?:is|es)\b|\btreatment\b|\bhealth\s*record\b/i,
+];
+
+function escapeRegExp(text) {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function hasKeywordProximity(text, keywords, valuePattern, window = 24) {
+  if (!text) return false;
+  for (const kw of keywords) {
+    const kwEsc = escapeRegExp(kw);
+    const forward = new RegExp(`${kwEsc}[\\s\\S]{0,${window}}${valuePattern.source}`, 'i');
+    const backward = new RegExp(`${valuePattern.source}[\\s\\S]{0,${window}}${kwEsc}`, 'i');
+    if (forward.test(text) || backward.test(text)) return true;
+  }
+  return false;
+}
+
+function containsSensitiveText(text) {
+  if (!text || typeof text !== 'string') return false;
+  if (PHI_PATTERNS.some((rx) => rx.test(text))) return true;
+  if (hasKeywordProximity(text, DOB_KEYWORDS, DOB_DATE_PATTERN, 24)) return true;
+  if (hasKeywordProximity(text, SSN_KEYWORDS, SSN_NUMBER_PATTERN, 24)) return true;
+  return false;
+}
+
+function containsSensitivePayload(payload) {
+  try {
+    const text = JSON.stringify(payload ?? {});
+    return containsSensitiveText(text);
+  } catch {
+    return false;
+  }
+}
+
+function buildFirewallResponse(taskCreated) {
+  return {
+    status: 'blocked_sensitive',
+    reason: 'phi_pii_detected',
+    task_created: !!taskCreated,
+    message: taskCreated
+      ? 'I can’t accept or process medical or sensitive financial details here. A follow-up task has been created so a licensed team member can reach out directly.'
+      : 'I can’t accept or process medical or sensitive financial details here. I couldn’t create the follow-up task automatically. Please follow up manually.',
+  };
+}
+
+async function createFollowupTaskInternal() {
+  const dueDateTime = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+  const assignedTo = process.env.DEFAULT_FOLLOWUP_ASSIGNEE || undefined;
+  const contactId = process.env.DEFAULT_FOLLOWUP_CONTACT_ID || undefined;
+
+  const taskData = {
+    title: 'Follow up — sensitive info attempted',
+    dueDate: dueDateTime,
+    description:
+      'Client attempted to share restricted details in PCC chat. Call to complete intake offline.',
+  };
+
+  if (assignedTo) taskData.assignedTo = assignedTo;
+
+  if (contactId) {
+    return await ghlRequest('POST', `/contacts/${contactId}/tasks`, {
+      body: taskData,
+    });
+  }
+
+  if (!GHL_LOCATION_ID) {
+    return { ok: false, status: 400, error: 'locationId is required' };
+  }
+
+  return await ghlRequest('POST', `/tasks`, {
+    body: {
+      ...taskData,
+      locationId: GHL_LOCATION_ID,
+    },
+  });
+}
+
+async function triggerFirewallTask(toolName, source = 'mcp') {
+  if (DRY_RUN) {
+    console.log('[FIREWALL]', {
+      ts: new Date().toISOString(),
+      tool_attempted: toolName,
+      firewall_triggered: true,
+      task_created: false,
+      source,
+    });
+    return { ok: true, task_created: false };
+  }
+
+  let taskCreated = false;
+  try {
+    const result = await createFollowupTaskInternal();
+    taskCreated = Boolean(result?.ok);
+  } catch {
+    taskCreated = false;
+  }
+
+  console.log('[FIREWALL]', {
+    ts: new Date().toISOString(),
+    tool_attempted: toolName,
+    firewall_triggered: true,
+    task_created: taskCreated,
+    source,
+  });
+
+  return { ok: true, task_created: taskCreated };
+}
+
+async function handleSensitiveFirewall(toolName) {
+  const result = await triggerFirewallTask(toolName, 'mcp');
+  return buildFirewallResponse(result.task_created);
+}
+
+// ============================================================================
+// Approval Gating
+// ============================================================================
+
+const WRITE_TOOLS = new Set([
+  'contacts_upsert',
+  'contacts_update_status',
+  'calendar_create_appointment',
+  'calendar_reschedule_appointment',
+  'calendar_cancel_appointment',
+  'locations_tags_create',
+  'locations_tags_delete',
+  'tasks_create',
+  'tasks_complete',
+  'conversations_send_message',
+  'conversations_send_new_email',
+]);
+
+const WRITE_TOOL_ENDPOINTS = {
+  contacts_upsert: { method: 'POST', endpoint: '/contacts or /contacts/{id}' },
+  contacts_update_status: { method: 'PUT', endpoint: '/contacts/{contactId}' },
+  calendar_create_appointment: { method: 'POST', endpoint: '/calendars/events/appointments' },
+  calendar_reschedule_appointment: { method: 'PUT', endpoint: '/appointments/{id}' },
+  calendar_cancel_appointment: { method: 'PUT', endpoint: '/appointments/{id}/cancel' },
+  locations_tags_create: { method: 'POST', endpoint: '/locations/{id}/tags' },
+  locations_tags_delete: { method: 'DELETE', endpoint: '/locations/{id}/tags/{tagId}' },
+  tasks_create: { method: 'POST', endpoint: '/contacts/{contactId}/tasks' },
+  tasks_complete: { method: 'PUT', endpoint: '/tasks/{taskId}/complete' },
+  conversations_send_message: { method: 'POST', endpoint: '/conversations/messages' },
+  conversations_send_new_email: { method: 'POST', endpoint: '/conversations/messages' },
+};
+
+const proposalStore = new Map();
+
+function cleanupProposals() {
+  const now = Date.now();
+  for (const [id, proposal] of proposalStore.entries()) {
+    if (proposal.expiresAt <= now) {
+      proposalStore.delete(id);
+    }
+  }
+}
+
+setInterval(cleanupProposals, Math.max(10000, Math.floor(PROPOSAL_TTL_MS / 2)));
+
+function hashParams(params) {
+  return crypto.createHash('sha256').update(JSON.stringify(params ?? {})).digest('hex');
+}
+
+function summarizeArgs(args) {
+  if (!args || typeof args !== 'object') return 'no parameters';
+  const keys = Object.keys(args);
+  return keys.length ? `fields: ${keys.join(', ')}` : 'no parameters';
+}
+
+function validateRequiredFields(tool, args) {
+  const required = tool?.inputSchema?.required || [];
+  const missing = required.filter((key) => args?.[key] === undefined || args?.[key] === null || args?.[key] === '');
+  return missing;
+}
+
+function createProposal(toolName, args) {
+  const proposalId = crypto.randomUUID();
+  const paramsHash = hashParams(args);
+  const expiresAt = Date.now() + PROPOSAL_TTL_MS;
+  const summary = `${toolName} (${summarizeArgs(args)})`;
+  const proposal = { proposalId, toolName, args, paramsHash, summary, expiresAt };
+  proposalStore.set(proposalId, proposal);
+  return proposal;
 }
 
 // ============================================================================
@@ -893,7 +1093,7 @@ async function handleTasksList(args) {
  * Create task
  */
 async function handleTasksCreate(args) {
-  const { title, dueDateTime, contactId, priority, locationId } = args;
+  const { title, dueDateTime, contactId, priority, locationId, description, assignedTo } = args;
   
   if (!title) {
     return { error: 'title is required', status: 400 };
@@ -903,13 +1103,8 @@ async function handleTasksCreate(args) {
   }
 
   const locId = locationId || GHL_LOCATION_ID;
-  if (!locId) {
+  if (!locId && !contactId) {
     return { error: 'locationId is required', status: 400 };
-  }
-
-  // contactId is optional - GHL API requires it, so validate if not provided
-  if (!contactId) {
-    return { error: 'contactId is required by GHL API', status: 400 };
   }
 
   const taskData = {
@@ -920,8 +1115,22 @@ async function handleTasksCreate(args) {
   if (priority && ['low', 'normal', 'high'].includes(priority)) {
     taskData.priority = priority;
   }
+  if (description) {
+    taskData.description = description;
+  }
+  if (assignedTo) {
+    taskData.assignedTo = assignedTo;
+  }
 
-  const result = await ghlRequest('POST', `/contacts/${contactId}/tasks`, {
+  const endpoint = contactId
+    ? `/contacts/${contactId}/tasks`
+    : `/tasks`;
+
+  if (!contactId) {
+    taskData.locationId = locId;
+  }
+
+  const result = await ghlRequest('POST', endpoint, {
     body: taskData,
   });
 
@@ -1134,10 +1343,17 @@ const ALLOWED_TOOLS = new Set([
   'tasks_complete',
 ]);
 
+const DEFAULT_ROLE_ALLOWLIST = ['executive', 'recruit', 'client'];
+
 const TOOLS = {
   contacts_search: {
     name: 'contacts_search',
     description: 'Search contacts by query',
+    readWrite: 'read',
+    approval_required: false,
+    dry_run_supported: true,
+    safe_logging: true,
+    role_allowlist: DEFAULT_ROLE_ALLOWLIST,
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -1153,6 +1369,11 @@ const TOOLS = {
   contacts_upsert: {
     name: 'contacts_upsert',
     description: 'Create or update a contact',
+    readWrite: 'write',
+    approval_required: true,
+    dry_run_supported: true,
+    safe_logging: true,
+    role_allowlist: DEFAULT_ROLE_ALLOWLIST,
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -1170,6 +1391,11 @@ const TOOLS = {
   contacts_update_status: {
     name: 'contacts_update_status',
     description: 'Update tags/stage for a contact',
+    readWrite: 'write',
+    approval_required: true,
+    dry_run_supported: true,
+    safe_logging: true,
+    role_allowlist: DEFAULT_ROLE_ALLOWLIST,
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -1186,6 +1412,11 @@ const TOOLS = {
   calendars_list: {
     name: "calendars_list",
     description: "List calendars for a location",
+    readWrite: 'read',
+    approval_required: false,
+    dry_run_supported: true,
+    safe_logging: true,
+    role_allowlist: DEFAULT_ROLE_ALLOWLIST,
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -1198,6 +1429,11 @@ const TOOLS = {
   calendar_free_slots: {
     name: "calendar_free_slots",
     description: "List available free slots for a calendar",
+    readWrite: 'read',
+    approval_required: false,
+    dry_run_supported: true,
+    safe_logging: true,
+    role_allowlist: DEFAULT_ROLE_ALLOWLIST,
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -1216,6 +1452,11 @@ const TOOLS = {
   calendar_list_appointments: {
     name: 'calendar_list_appointments',
     description: 'List appointments in a calendar window',
+    readWrite: 'read',
+    approval_required: false,
+    dry_run_supported: true,
+    safe_logging: true,
+    role_allowlist: DEFAULT_ROLE_ALLOWLIST,
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -1232,6 +1473,11 @@ const TOOLS = {
   calendar_create_appointment: {
     name: 'calendar_create_appointment',
     description: 'Create an appointment',
+    readWrite: 'write',
+    approval_required: true,
+    dry_run_supported: true,
+    safe_logging: true,
+    role_allowlist: DEFAULT_ROLE_ALLOWLIST,
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -1249,6 +1495,11 @@ const TOOLS = {
   calendar_reschedule_appointment: {
     name: 'calendar_reschedule_appointment',
     description: 'Reschedule an appointment',
+    readWrite: 'write',
+    approval_required: true,
+    dry_run_supported: true,
+    safe_logging: true,
+    role_allowlist: DEFAULT_ROLE_ALLOWLIST,
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -1264,6 +1515,11 @@ const TOOLS = {
   calendar_cancel_appointment: {
     name: 'calendar_cancel_appointment',
     description: 'Cancel an appointment',
+    readWrite: 'write',
+    approval_required: true,
+    dry_run_supported: true,
+    safe_logging: true,
+    role_allowlist: DEFAULT_ROLE_ALLOWLIST,
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -1278,6 +1534,11 @@ const TOOLS = {
   locations_tags_list: {
     name: 'locations_tags_list',
     description: 'List tags for a location',
+    readWrite: 'read',
+    approval_required: false,
+    dry_run_supported: true,
+    safe_logging: true,
+    role_allowlist: DEFAULT_ROLE_ALLOWLIST,
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -1291,6 +1552,11 @@ const TOOLS = {
   locations_tags_create: {
     name: 'locations_tags_create',
     description: 'Create a tag for a location',
+    readWrite: 'write',
+    approval_required: true,
+    dry_run_supported: true,
+    safe_logging: true,
+    role_allowlist: DEFAULT_ROLE_ALLOWLIST,
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -1305,6 +1571,11 @@ const TOOLS = {
   locations_tags_delete: {
     name: 'locations_tags_delete',
     description: 'Delete a tag for a location',
+    readWrite: 'write',
+    approval_required: true,
+    dry_run_supported: true,
+    safe_logging: true,
+    role_allowlist: DEFAULT_ROLE_ALLOWLIST,
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -1319,6 +1590,11 @@ const TOOLS = {
   conversations_report: {
     name: 'conversations_report',
     description: 'Get conversations report summary for a location (uses API report if available, otherwise derives from conversations search)',
+    readWrite: 'read',
+    approval_required: false,
+    dry_run_supported: true,
+    safe_logging: true,
+    role_allowlist: DEFAULT_ROLE_ALLOWLIST,
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -1337,6 +1613,11 @@ const TOOLS = {
   tasks_list: {
     name: 'tasks_list',
     description: 'List tasks by due window',
+    readWrite: 'read',
+    approval_required: false,
+    dry_run_supported: true,
+    safe_logging: true,
+    role_allowlist: DEFAULT_ROLE_ALLOWLIST,
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -1350,6 +1631,11 @@ const TOOLS = {
   tasks_create: {
     name: 'tasks_create',
     description: 'Create a task',
+    readWrite: 'write',
+    approval_required: true,
+    dry_run_supported: true,
+    safe_logging: true,
+    role_allowlist: DEFAULT_ROLE_ALLOWLIST,
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -1357,15 +1643,23 @@ const TOOLS = {
         title: { type: 'string' },
         dueDateTime: { type: 'string' },
         contactId: { type: 'string' },
+        description: { type: 'string' },
+        assignedTo: { type: 'string' },
+        locationId: { type: 'string' },
         priority: { type: 'string', enum: ['low', 'normal', 'high'] },
       },
-      required: ['title', 'dueDateTime', 'contactId'],
+      required: ['title', 'dueDateTime'],
     },
     handler: handleTasksCreate,
   },
   tasks_complete: {
     name: 'tasks_complete',
     description: 'Complete task',
+    readWrite: 'write',
+    approval_required: true,
+    dry_run_supported: true,
+    safe_logging: true,
+    role_allowlist: DEFAULT_ROLE_ALLOWLIST,
     inputSchema: {
       type: 'object',
       properties: {
@@ -1379,6 +1673,11 @@ const TOOLS = {
   conversations_list_threads: {
     name: 'conversations_list_threads',
     description: 'List recent threads for a channel',
+    readWrite: 'read',
+    approval_required: false,
+    dry_run_supported: true,
+    safe_logging: true,
+    role_allowlist: DEFAULT_ROLE_ALLOWLIST,
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -1393,6 +1692,11 @@ const TOOLS = {
   conversations_get_thread: {
     name: 'conversations_get_thread',
     description: 'Fetch messages for a thread',
+    readWrite: 'read',
+    approval_required: false,
+    dry_run_supported: true,
+    safe_logging: true,
+    role_allowlist: DEFAULT_ROLE_ALLOWLIST,
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -1407,6 +1711,11 @@ const TOOLS = {
   conversations_send_message: {
     name: 'conversations_send_message',
     description: 'Send a message into an existing thread',
+    readWrite: 'write',
+    approval_required: true,
+    dry_run_supported: true,
+    safe_logging: true,
+    role_allowlist: DEFAULT_ROLE_ALLOWLIST,
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -1422,6 +1731,11 @@ const TOOLS = {
   conversations_send_new_email: {
     name: 'conversations_send_new_email',
     description: 'Start a new email thread (outbound email)',
+    readWrite: 'write',
+    approval_required: true,
+    dry_run_supported: true,
+    safe_logging: true,
+    role_allowlist: DEFAULT_ROLE_ALLOWLIST,
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -1469,6 +1783,49 @@ async function handleTool(toolName, args) {
   }
 
   try {
+    if (DRY_RUN && WRITE_TOOLS.has(toolName)) {
+      const missing = validateRequiredFields(tool, args);
+      if (missing.length > 0) {
+        return {
+          error: `Missing required fields: ${missing.join(', ')}`,
+          status: 400,
+          details: {
+            endpoint: toolName,
+            status: 400,
+          },
+        };
+      }
+      const meta = WRITE_TOOL_ENDPOINTS[toolName] || { method: 'POST', endpoint: toolName };
+      return {
+        dryRun: true,
+        validated: true,
+        wouldCall: meta,
+      };
+    }
+
+    if (WRITE_TOOLS.has(toolName)) {
+      const missing = validateRequiredFields(tool, args);
+      if (missing.length > 0) {
+        return {
+          error: `Missing required fields: ${missing.join(', ')}`,
+          status: 400,
+          details: {
+            endpoint: toolName,
+            status: 400,
+          },
+        };
+      }
+      const proposal = createProposal(toolName, args);
+      return {
+        status: 'proposed',
+        proposal_id: proposal.proposalId,
+        tool: toolName,
+        params_hash: proposal.paramsHash,
+        summary: proposal.summary,
+        expires_at: new Date(proposal.expiresAt).toISOString(),
+      };
+    }
+
     const result = await tool.handler(args);
     
     // Normalize error responses - ensure details includes endpoint
@@ -1502,6 +1859,10 @@ async function handleTool(toolName, args) {
 // ============================================================================
 // Routes
 // ============================================================================
+
+// Preflight for MCP endpoints (avoid CORS/SSE confusion)
+app.options('/mcp', (req, res) => res.sendStatus(204));
+app.options('/api/mcp', (req, res) => res.sendStatus(204));
 
 // Health check
 app.get('/health', (req, res) => {
@@ -1553,6 +1914,11 @@ app.get('/api/mcp/tools', requireApiKey, (req, res) => {
       name: tool.name,
       description: tool.description,
       inputSchema: tool.inputSchema,
+      readWrite: tool.readWrite,
+      approval_required: tool.approval_required,
+      dry_run_supported: tool.dry_run_supported,
+      safe_logging: tool.safe_logging,
+      role_allowlist: tool.role_allowlist,
     }));
   
   res.json({ tools });
@@ -1567,23 +1933,39 @@ app.get('/mcp/tools', requireApiKey, (req, res) => {
       name: tool.name,
       description: tool.description,
       inputSchema: tool.inputSchema,
+      readWrite: tool.readWrite,
+      approval_required: tool.approval_required,
+      dry_run_supported: tool.dry_run_supported,
+      safe_logging: tool.safe_logging,
+      role_allowlist: tool.role_allowlist,
     }));
   
   res.json({ tools });
 });
 
-// OAuth routes - hard disabled (410)
+// OAuth routes - disabled by default
 app.get(/^\/oauth/, (req, res) => {
-  res.status(410).json({
-    error: 'OAuth is disabled',
+  if (!ENABLE_OAUTH) {
+    return res.status(404).json({ error: 'Not found' });
+  }
+  return res.status(410).json({
+    error: 'OAuth not enabled',
     message: 'This server uses Private Integration Token (PIT) authentication only',
   });
 });
 
-// Direct tool invocation
+// Direct tool invocation (legacy) - disabled by default
 app.post('/tools/:toolName', requireApiKey, async (req, res) => {
+  if (!ENABLE_LEGACY_TOOLS) {
+    return res.status(404).json({ error: 'Not found' });
+  }
   const { toolName } = req.params;
   const args = req.body;
+
+  if (containsSensitivePayload(args)) {
+    const blocked = await handleSensitiveFirewall(toolName || 'unknown');
+    return res.json(blocked);
+  }
   
   const result = await handleTool(toolName, args);
   
@@ -1674,6 +2056,11 @@ if (normalizedMethod === "initialize") {
         name: tool.name,
         description: tool.description,
         inputSchema: tool.inputSchema,
+        readWrite: tool.readWrite,
+        approval_required: tool.approval_required,
+        dry_run_supported: tool.dry_run_supported,
+        safe_logging: tool.safe_logging,
+        role_allowlist: tool.role_allowlist,
       }));
     
     // Structured logging for tools/list
@@ -1729,6 +2116,124 @@ if (normalizedMethod === "initialize") {
     });
   }
   
+  // Handle firewall/trigger (safe follow-up task creation)
+  if (normalizedMethod === 'firewall/trigger' || normalizedMethod === 'firewall.trigger') {
+    const { tool_attempted, source } = requestParams || {};
+    if (!tool_attempted || typeof tool_attempted !== 'string') {
+      return res.json({
+        jsonrpc: '2.0',
+        id: requestId,
+        error: { code: -32602, message: 'Invalid params: tool_attempted required' },
+      });
+    }
+    if (source && source !== 'bff' && source !== 'mcp') {
+      return res.json({
+        jsonrpc: '2.0',
+        id: requestId,
+        error: { code: -32602, message: 'Invalid params: source must be bff or mcp' },
+      });
+    }
+    const result = await triggerFirewallTask(tool_attempted, source || 'mcp');
+    return res.json({
+      jsonrpc: '2.0',
+      id: requestId,
+      result,
+    });
+  }
+
+  // Handle tools/approve (approval gating for write tools)
+  if (normalizedMethod === 'tools/approve' || normalizedMethod === 'tools.approve') {
+    const { proposal_id, approve } = requestParams || {};
+    if (!proposal_id) {
+      return res.json({
+        jsonrpc: '2.0',
+        id: requestId,
+        error: { code: -32602, message: 'Invalid params: proposal_id required' },
+      });
+    }
+    const proposal = proposalStore.get(proposal_id);
+    if (!proposal) {
+      return res.json({
+        jsonrpc: '2.0',
+        id: requestId,
+        error: { code: -32000, message: 'Proposal not found or expired' },
+      });
+    }
+    if (proposal.expiresAt <= Date.now()) {
+      proposalStore.delete(proposal_id);
+      return res.json({
+        jsonrpc: '2.0',
+        id: requestId,
+        error: { code: -32000, message: 'Proposal expired' },
+      });
+    }
+    if (approve !== true) {
+      proposalStore.delete(proposal_id);
+      return res.json({
+        jsonrpc: '2.0',
+        id: requestId,
+        result: { status: 'rejected', proposal_id },
+      });
+    }
+
+    if (DRY_RUN) {
+      const meta = WRITE_TOOL_ENDPOINTS[proposal.toolName] || { method: 'POST', endpoint: proposal.toolName };
+      return res.json({
+        jsonrpc: '2.0',
+        id: requestId,
+        result: { dryRun: true, validated: true, wouldCall: meta, proposal_id },
+      });
+    }
+
+    const tool = TOOLS[proposal.toolName];
+    if (!tool) {
+      proposalStore.delete(proposal_id);
+      return res.json({
+        jsonrpc: '2.0',
+        id: requestId,
+        error: { code: -32000, message: 'Tool no longer available' },
+      });
+    }
+
+    let execResult;
+    try {
+      execResult = await tool.handler(proposal.args);
+    } catch (err) {
+      execResult = { error: 'Internal server error', status: 500 };
+    }
+    proposalStore.delete(proposal_id);
+
+    const auditStatus = execResult?.error ? 'error' : 'success';
+    console.log(`[AUDIT]`, {
+      ts: new Date().toISOString(),
+      tool: proposal.toolName,
+      proposal_id,
+      result_status: auditStatus,
+    });
+
+    if (execResult?.error) {
+      return res.json({
+        jsonrpc: '2.0',
+        id: requestId,
+        error: {
+          code: -32000,
+          message: execResult.error,
+          data: { status: execResult.status || 500 },
+        },
+      });
+    }
+
+    return res.json({
+      jsonrpc: '2.0',
+      id: requestId,
+      result: {
+        content: [
+          { type: 'text', text: JSON.stringify(execResult ?? {}, null, 2) },
+        ],
+      },
+    });
+  }
+
   // Handle tools/call (support both "tools/call" and "tools.call")
   if (normalizedMethod === 'tools/call') {
     const { name, arguments: args } = requestParams || {};
@@ -1748,6 +2253,20 @@ if (normalizedMethod === "initialize") {
         error: {
           code: -32602,
           message: 'Invalid params: tool name required',
+        },
+      });
+    }
+
+    // PHI/PII firewall (runs before proposal or execution)
+    if (containsSensitivePayload(args)) {
+      const blocked = await handleSensitiveFirewall(name || 'unknown');
+      return res.json({
+        jsonrpc: '2.0',
+        id: requestId,
+        result: {
+          content: [
+            { type: 'text', text: JSON.stringify(blocked, null, 2) },
+          ],
         },
       });
     }

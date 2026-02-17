@@ -3,6 +3,7 @@ const fs = require("fs");
 const path = require("path");
 
 const app = express();
+const ENABLE_LEGACY_TOOLS = process.env.ENABLE_LEGACY_TOOLS === "1";
 
 function requireApiKey(req, res, next) {
   const apiKey = req.headers["x-api-key"];
@@ -61,6 +62,9 @@ app.get("/api/mcp/tools.manifest.json", requireApiKey, (req, res) => sendManifes
 app.use(express.json());
 
 app.post("/tools/:toolName", requireApiKey, (req, res) => {
+  if (!ENABLE_LEGACY_TOOLS) {
+    return res.status(404).json({ ok: false, error: "Not found" });
+  }
   const { toolName } = req.params;
 
   // OPTIONAL: enforce API key at app layer too (if nginx not used)
@@ -70,7 +74,6 @@ app.post("/tools/:toolName", requireApiKey, (req, res) => {
     ok: true,
     mode: "mock",
     tool: toolName,
-    received: req.body ?? null,
     result: {
       message: `Mock response for ${toolName}`,
       timestamp: new Date().toISOString(),
@@ -92,4 +95,3 @@ const PORT = 3334;
 app.listen(PORT, "127.0.0.1", () => {
   console.log(`GHL MCP Server running on port ${PORT}`);
 });
-
