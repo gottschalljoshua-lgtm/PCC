@@ -36,8 +36,12 @@ RESP=$(curl -s "$BASE_URL" \
   --data-binary "$PROPOSE_PAYLOAD")
 
 PROPOSAL_ID=$(echo "$RESP" | jq -r '
-  (.result.content[0].text // empty)
-  | (try (fromjson | .proposal_id // .proposalId) catch empty)
+  if .result.proposal_id then .result.proposal_id
+  elif .result.proposalId then .result.proposalId
+  else
+    (.result.content[0].text // empty)
+    | (try (fromjson | .proposal_id // .proposalId) catch empty)
+  end
 ')
 
 if [[ -z "$PROPOSAL_ID" || "$PROPOSAL_ID" == "null" ]]; then
@@ -57,3 +61,6 @@ curl -s "$BASE_URL" \
   -H "Content-Type: application/json" \
   -H "x-api-key: $API_KEY" \
   --data-binary "$APPROVE_PAYLOAD" | jq .
+
+echo "Get proposal status:"
+echo "./infra/rpc.sh tools/proposals/get '{\"proposal_id\":\"$PROPOSAL_ID\"}'"

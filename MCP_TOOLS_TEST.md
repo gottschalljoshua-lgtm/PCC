@@ -18,20 +18,14 @@ The MCP Gateway exposes only these tools, matching GHL Private Integration scope
 12. `tasks_create` - Create a task
 13. `tasks_complete` - Complete task
 
-## Test Commands
+## Test Commands (Wrap-Safe)
+
+All examples below use `infra/rpc.sh` or `infra/propose_approve.sh` to prevent JSON wrap errors.
 
 ### List All Tools
 
 ```bash
-curl -X POST https://api.command-finfitlife.com/mcp \
-  -H "Content-Type: application/json" \
-  -H "x-api-key: 11111111112222222222333333333344" \
-  -d '{
-    "jsonrpc": "2.0",
-    "id": 1,
-    "method": "tools/list",
-    "params": {}
-  }'
+./infra/rpc.sh tools/list '{}'
 ```
 
 **Expected Response:**
@@ -55,21 +49,7 @@ curl -X POST https://api.command-finfitlife.com/mcp \
 ### Call contacts_search Tool
 
 ```bash
-curl -X POST https://api.command-finfitlife.com/mcp \
-  -H "Content-Type: application/json" \
-  -H "x-api-key: 11111111112222222222333333333344" \
-  -d '{
-    "jsonrpc": "2.0",
-    "id": 2,
-    "method": "tools/call",
-    "params": {
-      "name": "contacts_search",
-      "arguments": {
-        "query": "test@example.com",
-        "pageLimit": 10
-      }
-    }
-  }'
+./infra/rpc.sh tools/call '{"name":"contacts_search","arguments":{"query":"test@example.com","pageLimit":10}}'
 ```
 
 **Expected Response:**
@@ -110,133 +90,29 @@ Both methods are equivalent and use the same `MCP_API_KEY` value.
 ### List Recent Proposals
 
 ```bash
-curl -X POST https://api.command-finfitlife.com/mcp \
-  -H "Content-Type: application/json" \
-  -H "x-api-key: $MCP_API_KEY" \
-  -d '{
-    "jsonrpc": "2.0",
-    "id": 901,
-    "method": "tools/proposals/list",
-    "params": { "limit": 10 }
-  }'
-```
-
-### Create Proposal (Write Tool)
-
-```bash
-curl -X POST https://api.command-finfitlife.com/mcp \
-  -H "Content-Type: application/json" \
-  -H "x-api-key: $MCP_API_KEY" \
-  -d '{
-    "jsonrpc": "2.0",
-    "id": 902,
-    "method": "tools/call",
-    "params": {
-      "name": "tasks_create",
-      "arguments": {
-        "title": "PCC Test Task",
-        "dueDateTime": "2026-02-18T17:00:00-05:00",
-        "contactId": "CONTACT_ID"
-      }
-    }
-  }'
-```
-
-### Approve Proposal
-
-```bash
-curl -X POST https://api.command-finfitlife.com/mcp \
-  -H "Content-Type: application/json" \
-  -H "x-api-key: $MCP_API_KEY" \
-  -d '{
-    "jsonrpc": "2.0",
-    "id": 903,
-    "method": "tools/approve",
-    "params": {
-      "proposal_id": "PASTE_PROPOSAL_ID",
-      "approve": true
-    }
-  }'
+./infra/rpc.sh tools/proposals/list '{"limit":10}'
 ```
 
 ### Get Proposal Record
 
 ```bash
-curl -X POST https://api.command-finfitlife.com/mcp \
-  -H "Content-Type: application/json" \
-  -H "x-api-key: $MCP_API_KEY" \
-  -d '{
-    "jsonrpc": "2.0",
-    "id": 904,
-    "method": "tools/proposals/get",
-    "params": { "proposal_id": "PASTE_PROPOSAL_ID" }
-  }'
-```
-
-## Verification (Proposals)
-
-### List Recent Proposals
-
-```bash
-curl -X POST https://api.command-finfitlife.com/mcp \
-  -H "Content-Type: application/json" \
-  -H "x-api-key: $MCP_API_KEY" \
-  -d '{
-    "jsonrpc": "2.0",
-    "id": 901,
-    "method": "tools/proposals/list",
-    "params": { "limit": 10 }
-  }'
+./infra/rpc.sh tools/proposals/get '{"proposal_id":"PASTE_PROPOSAL_ID"}'
 ```
 
 ### Create Proposal (Write Tool)
 
 ```bash
-curl -X POST https://api.command-finfitlife.com/mcp \
-  -H "Content-Type: application/json" \
-  -H "x-api-key: $MCP_API_KEY" \
-  -d '{
-    "jsonrpc": "2.0",
-    "id": 902,
-    "method": "tools/call",
-    "params": {
-      "name": "tasks_create",
-      "arguments": {
-        "title": "PCC Test Task",
-        "dueDateTime": "2026-02-18T17:00:00-05:00",
-        "contactId": "CONTACT_ID"
-      }
-    }
-  }'
+./infra/rpc.sh tools/call '{"name":"tasks_create","arguments":{"title":"PCC Test Task","dueDateTime":"2026-02-18T17:00:00-05:00","contactId":"CONTACT_ID"}}'
 ```
 
 ### Approve Proposal
 
 ```bash
-curl -X POST https://api.command-finfitlife.com/mcp \
-  -H "Content-Type: application/json" \
-  -H "x-api-key: $MCP_API_KEY" \
-  -d '{
-    "jsonrpc": "2.0",
-    "id": 903,
-    "method": "tools/approve",
-    "params": {
-      "proposal_id": "PASTE_PROPOSAL_ID",
-      "approve": true
-    }
-  }'
+./infra/rpc.sh tools/approve '{"proposal_id":"PASTE_PROPOSAL_ID","approve":true}'
 ```
 
-### Get Proposal Record
+### One-Command Propose + Approve
 
 ```bash
-curl -X POST https://api.command-finfitlife.com/mcp \
-  -H "Content-Type: application/json" \
-  -H "x-api-key: $MCP_API_KEY" \
-  -d '{
-    "jsonrpc": "2.0",
-    "id": 904,
-    "method": "tools/proposals/get",
-    "params": { "proposal_id": "PASTE_PROPOSAL_ID" }
-  }'
+./infra/propose_approve.sh tasks_create '{"title":"PCC Test Task","dueDateTime":"2026-02-18T17:00:00-05:00","contactId":"CONTACT_ID"}'
 ```
