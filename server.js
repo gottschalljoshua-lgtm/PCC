@@ -61,6 +61,7 @@ if (dotenvResult.error) {
 const express = require('express');
 const cors = require('cors');
 const crypto = require('crypto');
+const { ProposalStore } = require('./proposals');
 
 const app = express();
 
@@ -73,7 +74,7 @@ const MCP_API_KEY = process.env.MCP_API_KEY;
 const DRY_RUN = process.env.DRY_RUN === '1';
 const ENABLE_OAUTH = process.env.ENABLE_OAUTH === '1';
 const ENABLE_LEGACY_TOOLS = process.env.ENABLE_LEGACY_TOOLS === '1';
-const PROPOSAL_TTL_MS = Number(process.env.PROPOSAL_TTL_MS || 5 * 60 * 1000);
+const PROPOSAL_TTL_SECONDS = Number(process.env.PROPOSAL_TTL_SECONDS || 900);
 const GHL_PIT_TOKEN = process.env.GHL_PIT_TOKEN;
 const GHL_LOCATION_ID = process.env.GHL_LOCATION_ID;
 const GHL_API_BASE = process.env.GHL_API_BASE || 'https://services.leadconnectorhq.com';
@@ -321,18 +322,10 @@ const WRITE_TOOL_ENDPOINTS = {
   conversations_send_new_email: { method: 'POST', endpoint: '/conversations/messages' },
 };
 
-const proposalStore = new Map();
-
-function cleanupProposals() {
-  const now = Date.now();
-  for (const [id, proposal] of proposalStore.entries()) {
-    if (proposal.expiresAt <= now) {
-      proposalStore.delete(id);
-    }
-  }
-}
-
-setInterval(cleanupProposals, Math.max(10000, Math.floor(PROPOSAL_TTL_MS / 2)));
+const proposalStore = new ProposalStore({
+  ttlSeconds: PROPOSAL_TTL_SECONDS,
+  filePath: process.env.PROPOSAL_STORE_PATH || '/home/ec2-user/mcp-ghl/.data/proposals.json',
+});
 
 function hashParams(params) {
   return crypto.createHash('sha256').update(JSON.stringify(params ?? {})).digest('hex');
@@ -351,13 +344,9 @@ function validateRequiredFields(tool, args) {
 }
 
 function createProposal(toolName, args) {
-  const proposalId = crypto.randomUUID();
   const paramsHash = hashParams(args);
-  const expiresAt = Date.now() + PROPOSAL_TTL_MS;
   const summary = `${toolName} (${summarizeArgs(args)})`;
-  const proposal = { proposalId, toolName, args, paramsHash, summary, expiresAt };
-  proposalStore.set(proposalId, proposal);
-  return proposal;
+  return proposalStore.createProposal(toolName, args, paramsHash, summary);
 }
 
 // ============================================================================
@@ -1818,9 +1807,9 @@ async function handleTool(toolName, args) {
       const proposal = createProposal(toolName, args);
       return {
         status: 'proposed',
-        proposal_id: proposal.proposalId,
+        proposal_id: proposal.proposal_id,
         tool: toolName,
-        params_hash: proposal.paramsHash,
+        params_hash: proposal.params_hash,
         summary: proposal.summary,
         expires_at: new Date(proposal.expiresAt).toISOString(),
       };
@@ -2141,6 +2130,47 @@ if (normalizedMethod === "initialize") {
     });
   }
 
+  // Proposal inspection helpers (debugging)
+  if (normalizedMethod === 'tools/proposals/list' || normalizedMethod === 'tools.proposals.list') {
+    const { limit, status } = requestParams || {};
+    const safeProposals = proposalStore
+      .list({ limit: Number(limit) || 20, status })
+      .map((proposal) => proposalStore.toSafeProposal(proposal));
+    return res.json({
+      jsonrpc: '2.0',
+      id: requestId,
+      result: { proposals: safeProposals },
+    });
+  }
+
+  if (normalizedMethod === 'tools/proposals/get' || normalizedMethod === 'tools.proposals.get') {
+    const { proposal_id } = requestParams || {};
+    if (!proposal_id) {
+      return res.json({
+        jsonrpc: '2.0',
+        id: requestId,
+        error: { code: -32602, message: 'Invalid params: proposal_id required' },
+      });
+    }
+    const proposal = proposalStore.get(proposal_id);
+    if (!proposal) {
+      return res.json({
+        jsonrpc: '2.0',
+        id: requestId,
+        error: {
+          code: -32000,
+          message: 'Proposal not found or expired',
+          data: { hint: 'Use tools/proposals/list to find active proposals', serverTime: new Date().toISOString() },
+        },
+      });
+    }
+    return res.json({
+      jsonrpc: '2.0',
+      id: requestId,
+      result: { proposal: proposalStore.toSafeProposal(proposal) },
+    });
+  }
+
   // Handle tools/approve (approval gating for write tools)
   if (normalizedMethod === 'tools/approve' || normalizedMethod === 'tools.approve') {
     const { proposal_id, approve } = requestParams || {};
@@ -2156,19 +2186,27 @@ if (normalizedMethod === "initialize") {
       return res.json({
         jsonrpc: '2.0',
         id: requestId,
-        error: { code: -32000, message: 'Proposal not found or expired' },
+        error: {
+          code: -32000,
+          message: 'Proposal not found or expired',
+          data: { hint: 'Use tools/proposals/list to find active proposals', serverTime: new Date().toISOString() },
+        },
       });
     }
     if (proposal.expiresAt <= Date.now()) {
-      proposalStore.delete(proposal_id);
+      proposalStore.update(proposal_id, { status: 'expired' });
       return res.json({
         jsonrpc: '2.0',
         id: requestId,
-        error: { code: -32000, message: 'Proposal expired' },
+        error: {
+          code: -32000,
+          message: 'Proposal not found or expired',
+          data: { hint: 'Use tools/proposals/list to find active proposals', serverTime: new Date().toISOString() },
+        },
       });
     }
     if (approve !== true) {
-      proposalStore.delete(proposal_id);
+      proposalStore.update(proposal_id, { status: 'rejected' });
       return res.json({
         jsonrpc: '2.0',
         id: requestId,
@@ -2177,7 +2215,8 @@ if (normalizedMethod === "initialize") {
     }
 
     if (DRY_RUN) {
-      const meta = WRITE_TOOL_ENDPOINTS[proposal.toolName] || { method: 'POST', endpoint: proposal.toolName };
+      const meta = WRITE_TOOL_ENDPOINTS[proposal.tool] || { method: 'POST', endpoint: proposal.tool };
+      proposalStore.update(proposal_id, { status: 'executed', result: { dryRun: true, validated: true, wouldCall: meta } });
       return res.json({
         jsonrpc: '2.0',
         id: requestId,
@@ -2185,9 +2224,9 @@ if (normalizedMethod === "initialize") {
       });
     }
 
-    const tool = TOOLS[proposal.toolName];
+    const tool = TOOLS[proposal.tool];
     if (!tool) {
-      proposalStore.delete(proposal_id);
+      proposalStore.update(proposal_id, { status: 'error', error: { message: 'Tool no longer available' } });
       return res.json({
         jsonrpc: '2.0',
         id: requestId,
@@ -2197,16 +2236,20 @@ if (normalizedMethod === "initialize") {
 
     let execResult;
     try {
-      execResult = await tool.handler(proposal.args);
+      execResult = await tool.handler(proposal.arguments);
     } catch (err) {
       execResult = { error: 'Internal server error', status: 500 };
     }
-    proposalStore.delete(proposal_id);
+    if (execResult?.error) {
+      proposalStore.update(proposal_id, { status: 'error', error: { message: execResult.error, status: execResult.status || 500 } });
+    } else {
+      proposalStore.update(proposal_id, { status: 'executed', result: execResult });
+    }
 
     const auditStatus = execResult?.error ? 'error' : 'success';
     console.log(`[AUDIT]`, {
       ts: new Date().toISOString(),
-      tool: proposal.toolName,
+      tool: proposal.tool,
       proposal_id,
       result_status: auditStatus,
     });
