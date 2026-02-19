@@ -6,34 +6,33 @@ if ! command -v jq >/dev/null 2>&1; then
   exit 1
 fi
 
-BASE_URL="${BASE_URL:-https://api.command-finfitlife.com/mcp}"
-API_KEY="${API_KEY:-${MCP_API_KEY:-}}"
-
-if [[ -z "${API_KEY}" ]]; then
-  echo "Missing API key. Set API_KEY or MCP_API_KEY." >&2
-  exit 1
-fi
-
 if [[ $# -lt 2 ]]; then
   echo "Usage: $0 <tool_name> '<json_arguments>'" >&2
+  echo "Examples:" >&2
+  echo "  $0 tasks_create '{\"title\":\"PCC Test Task\",\"dueDateTime\":\"2026-02-19T17:00:00-05:00\",\"contactId\":\"CONTACT_ID\"}'" >&2
+  echo "  $0 tasks_create @/tmp/task_args.json" >&2
   exit 1
 fi
 
 TOOL_NAME="$1"
-ARGS_JSON="$2"
-REQ_ID=$((RANDOM % 9000 + 1000))
+ARGS_RAW="$2"
 
-PROPOSE_PAYLOAD=$(jq -cn --arg name "$TOOL_NAME" --argjson args "$ARGS_JSON" --argjson id "$REQ_ID" '{
-  jsonrpc: "2.0",
-  id: $id,
-  method: "tools/call",
-  params: { name: $name, arguments: $args }
-}')
+if [[ "$ARGS_RAW" == @* ]]; then
+  ARGS_RAW="$(cat "${ARGS_RAW#@}")"
+fi
 
-RESP=$(curl -s "$BASE_URL" \
-  -H "Content-Type: application/json" \
-  -H "x-api-key: $API_KEY" \
-  --data-binary "$PROPOSE_PAYLOAD")
+ARGS="$(printf '%s' "$ARGS_RAW" | tr -d '\r\n')"
+
+if ! printf '%s' "$ARGS" | jq -e . >/dev/null 2>&1; then
+  PREVIEW="$(printf '%s' "$ARGS_RAW" | tr -d '\r\n' | head -c 120)"
+  echo "Params JSON is invalid. Preview: ${PREVIEW}" >&2
+  echo "Tip: use @/path/to/file.json for complex JSON." >&2
+  exit 1
+fi
+
+PROPOSE_PARAMS="$(jq -nc --arg name "$TOOL_NAME" --argjson args "$(printf '%s' "$ARGS" | jq -c .)" '{name:$name,arguments:$args}')"
+
+RESP="$(RPC_RAW=1 ./infra/rpc.sh tools/call "$PROPOSE_PARAMS")"
 
 PROPOSAL_ID=$(echo "$RESP" | jq -r '
   if .result.proposal_id then .result.proposal_id
@@ -50,17 +49,8 @@ if [[ -z "$PROPOSAL_ID" || "$PROPOSAL_ID" == "null" ]]; then
   exit 2
 fi
 
-APPROVE_PAYLOAD=$(jq -cn --arg pid "$PROPOSAL_ID" --argjson id "$((REQ_ID + 1))" '{
-  jsonrpc: "2.0",
-  id: $id,
-  method: "tools/approve",
-  params: { proposal_id: $pid, approve: true }
-}')
-
-curl -s "$BASE_URL" \
-  -H "Content-Type: application/json" \
-  -H "x-api-key: $API_KEY" \
-  --data-binary "$APPROVE_PAYLOAD" | jq .
+APPROVE_PARAMS="$(jq -nc --arg pid "$PROPOSAL_ID" '{proposal_id:$pid,approve:true}')"
+RPC_RAW=1 ./infra/rpc.sh tools/approve "$APPROVE_PARAMS" | jq .
 
 echo "Get proposal status:"
 echo "./infra/rpc.sh tools/proposals/get '{\"proposal_id\":\"$PROPOSAL_ID\"}'"

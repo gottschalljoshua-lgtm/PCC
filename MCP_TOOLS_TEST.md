@@ -21,6 +21,7 @@ The MCP Gateway exposes only these tools, matching GHL Private Integration scope
 ## Test Commands (Wrap-Safe)
 
 All examples below use `infra/rpc.sh` or `infra/propose_approve.sh` to prevent JSON wrap errors.
+For complex JSON (dates, long strings), use @file mode.
 
 ### List All Tools
 
@@ -102,7 +103,10 @@ Both methods are equivalent and use the same `MCP_API_KEY` value.
 ### Create Proposal (Write Tool)
 
 ```bash
-./infra/rpc.sh tools/call '{"name":"tasks_create","arguments":{"title":"PCC Test Task","dueDateTime":"2026-02-18T17:00:00-05:00","contactId":"CONTACT_ID"}}'
+cat > /tmp/task_args.json <<'JSON'
+{"title":"PCC Test Task","dueDateTime":"2026-02-18T17:00:00-05:00","contactId":"CONTACT_ID"}
+JSON
+./infra/propose_approve.sh tasks_create @/tmp/task_args.json
 ```
 
 ### Approve Proposal
@@ -114,5 +118,8 @@ Both methods are equivalent and use the same `MCP_API_KEY` value.
 ### One-Command Propose + Approve
 
 ```bash
-./infra/propose_approve.sh tasks_create '{"title":"PCC Test Task","dueDateTime":"2026-02-18T17:00:00-05:00","contactId":"CONTACT_ID"}'
+cat > /tmp/task_args.json <<'JSON'
+{"title":"PCC Test Task","dueDateTime":"2026-02-18T17:00:00-05:00","contactId":"CONTACT_ID"}
+JSON
+./infra/propose_approve.sh tasks_create @/tmp/task_args.json
 ```
